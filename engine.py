@@ -73,3 +73,8 @@ def build_graph(client, vector_db):
     workflow.add_conditional_edges("reviewer", should_continue)
 
     return workflow.compile()
+
+if __name__ == "__main__":
+    client, vector_db = init_infrastructure()
+    app = build_graph(client, vector_db)
+    print(app.get_graph().print_ascii())
