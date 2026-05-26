@@ -3,7 +3,7 @@ import streamlit.components.v1 as components
 import json
 import pandas as pd
 import time
-import base64
+import numpy as np
 import graphviz
 from engine import init_infrastructure, build_graph
 
@@ -19,64 +19,121 @@ def setup_backend():
 app_graph = setup_backend()
 
 # ==========================================
-# 📊 Graphviz 다이어그램 렌더링 헬퍼 함수
+# 🔄 파이프라인 노드 정의 (공통 상수)
+# ==========================================
+PIPELINE_ORDER = [
+    "baseline_forecaster", "planner", "strategist", 
+    "mitigated_forecaster", "analyst", "compiler", "reviewer"
+]
+
+NODE_LABELS = {
+    "baseline_forecaster": "Baseline Forecaster",
+    "planner": "Report Planner",
+    "strategist": "Strategist",
+    "mitigated_forecaster": "Mitigated Forecaster",
+    "analyst": "Analyst (Gap)",
+    "compiler": "Report Compiler",
+    "reviewer": "Reviewer (CCO)",
+}
+
+NODE_ICONS = {
+    "waiting": "⬜",
+    "running": "🔵",
+    "done": "✅",
+    "rejected": "❌",
+}
+
+# ==========================================
+# 📊 Graphviz 다이어그램 (컴팩트 버전)
 # ==========================================
 def render_pipeline_graph(completed_nodes, current_nodes, is_rejected=False):
-    # Graphviz Digraph (방향성 그래프) 객체 생성
     dot = graphviz.Digraph(engine='dot')
-    dot.attr(rankdir='TD')  # Top to Bottom (위에서 아래로)
-    
-    # 폰트 깨짐 방지 (한글 폰트 지정)
-    dot.attr('node', fontname='Malgun Gothic') 
+    dot.attr(rankdir='LR')  # 좌→우 방향으로 변경 (컴팩트)
+    dot.attr('graph', size='6,1.5', ratio='compress', nodesep='0.3', ranksep='0.4')
+    dot.attr('node', fontname='Malgun Gothic', fontsize='9', width='0.6', height='0.4', margin='0.08,0.04')
+    dot.attr('edge', arrowsize='0.5')
 
-    # 노드 정의 (id: 라벨)
     nodes = {
-        "START": "시작",
-        "analyzer": "1. 상황 분석기",
-        "forecaster": "2. NVI 시뮬레이터",
-        "planner": "3. TF 기획자",
-        "analyst": "4-A. 데이터 분석가",
-        "strategist": "4-B. PR 전략가",
-        "compiler": "5. 보고서 취합자",
-        "reviewer": "6. CCO 레드팀",
-        "END": "종료"
+        "S": ("", "circle"),
+        "BF": ("Baseline\nForecaster", "box"),
+        "PL": ("Planner", "box"),
+        "ST": ("Strategist", "box"),
+        "MF": ("Mitigated\nForecaster", "box"),
+        "AN": ("Analyst", "box"),
+        "CP": ("Compiler", "box"),
+        "RV": ("Reviewer", "box"),
+        "E": ("", "doublecircle"),
+    }
+    
+    # 노드 ID → 파이프라인 키 매핑
+    id_map = {
+        "S": "START", "BF": "baseline_forecaster", "PL": "planner",
+        "ST": "strategist", "MF": "mitigated_forecaster", 
+        "AN": "analyst", "CP": "compiler", "RV": "reviewer", "E": "END"
     }
 
-    # 동적 색상 할당
-    for node_id, label in nodes.items():
-        color = "#f8fafc"       # 기본 배경색 (회백색)
-        fontcolor = "#334155"   # 기본 글자색
-        shape = 'box' if node_id not in ['START', 'END'] else 'ellipse'
-
-        if node_id in current_nodes:
-            if node_id == "reviewer" and is_rejected:
-                color = "#ef4444"  # 빨간색 (반려)
-                fontcolor = "white"
+    for node_id, (label, shape) in nodes.items():
+        pipeline_key = id_map[node_id]
+        color = "#e2e8f0"
+        fontcolor = "#64748b"
+        penwidth = "1"
+        
+        if pipeline_key in current_nodes:
+            if pipeline_key == "reviewer" and is_rejected:
+                color = "#fca5a5"
+                fontcolor = "#991b1b"
+                penwidth = "2"
             else:
-                color = "#3b82f6"  # 파란색 (현재 실행 중)
-                fontcolor = "white"
-        elif node_id in completed_nodes or (node_id == "START" and completed_nodes):
-            color = "#10b981"      # 초록색 (완료)
-            fontcolor = "white"
+                color = "#93c5fd"
+                fontcolor = "#1e40af"
+                penwidth = "2"
+        elif pipeline_key in completed_nodes or (pipeline_key == "START" and completed_nodes):
+            color = "#86efac"
+            fontcolor = "#166534"
 
-        # 노드 추가
-        dot.node(node_id, label, style='filled,rounded', fillcolor=color, fontcolor=fontcolor, shape=shape)
+        dot.node(node_id, label, style='filled,rounded', fillcolor=color, 
+                 fontcolor=fontcolor, shape=shape, penwidth=penwidth)
 
-    # 엣지(화살표) 연결
-    dot.edge("START", "analyzer")
-    dot.edge("analyzer", "forecaster")
-    dot.edge("forecaster", "planner")
-    dot.edge("planner", "analyst")
-    dot.edge("planner", "strategist")
-    dot.edge("analyst", "compiler")
-    dot.edge("strategist", "compiler")
-    dot.edge("compiler", "reviewer")
-    
-    # 조건부 엣지
-    dot.edge("reviewer", "planner", label="반려", color="#ef4444", fontcolor="#ef4444", fontname='Malgun Gothic')
-    dot.edge("reviewer", "END", label="승인", color="#10b981", fontcolor="#10b981", fontname='Malgun Gothic')
+    # 순차 엣지
+    dot.edge("S", "BF")
+    dot.edge("BF", "PL")
+    dot.edge("PL", "ST")
+    dot.edge("ST", "MF")
+    dot.edge("MF", "AN")
+    dot.edge("AN", "CP")
+    dot.edge("CP", "RV")
+    dot.edge("RV", "E", label="OK", fontsize="8", color="#16a34a", fontcolor="#16a34a", fontname='Malgun Gothic')
+    dot.edge("RV", "PL", label="NG", fontsize="8", color="#dc2626", fontcolor="#dc2626", 
+             fontname='Malgun Gothic', style="dashed", constraint="false")
 
     return dot
+
+# ==========================================
+# 📋 리스트 전이 방식 파이프라인 상태 렌더링
+# ==========================================
+def render_pipeline_list(completed_nodes, current_nodes, is_rejected=False, loop_count=0):
+    """파이프라인 단계를 리스트 형태로 렌더링. 각 노드의 상태를 아이콘으로 표시."""
+    lines = []
+    if loop_count > 0:
+        lines.append(f"🔄 **Loop {loop_count + 1}**")
+    
+    for node_key in PIPELINE_ORDER:
+        label = NODE_LABELS[node_key]
+        if node_key in current_nodes:
+            if node_key == "reviewer" and is_rejected:
+                icon = NODE_ICONS["rejected"]
+                lines.append(f"{icon} ~~{label}~~ — 반려")
+            else:
+                icon = NODE_ICONS["running"]
+                lines.append(f"{icon} **{label}** ⏳")
+        elif node_key in completed_nodes:
+            icon = NODE_ICONS["done"]
+            lines.append(f"{icon} {label}")
+        else:
+            icon = NODE_ICONS["waiting"]
+            lines.append(f"{icon} {label}")
+    
+    return "\n\n".join(lines)
 
 # ==========================================
 # 🎨 Streamlit 대시보드 UI
@@ -84,120 +141,189 @@ def render_pipeline_graph(completed_nodes, current_nodes, is_rejected=False):
 st.set_page_config(page_title="PR 위기 대응 대시보드", page_icon="🚨", layout="wide")
 
 st.title("🚨 실시간 PR 위기 시뮬레이션 대시보드")
-st.markdown("분산형 에이전트 그룹의 협업 워크플로우를 활용한 실시간 여론(NVI) 추론 시스템")
+st.markdown("무대응(Do Nothing) vs 전략 적용(Mitigated) **이원화 시뮬레이션** 기반 위기 대응 시스템")
 
+# ==========================================
+# 📝 사이드바: 입력 파라미터 + Agent I/O 로그
+# ==========================================
 with st.sidebar:
     st.header("📝 입력 파라미터")
     target_csv = st.text_input("데이터셋 경로", value="data/pr_crisis_dataset.csv")
     
-    default_meta = """[현재 상황] 초기 대응 지연 및 무대응 기간 유튜버 2연타 타격으로 여론 최악 직면.
-[향후 대응 계획]
-- 4시간 뒤: '사실무근이며 깊은 유감이다'라는 1차 해명문 배포 (action_type: 1)
-- 24시간 뒤: 전면 리콜 공표 및 대표이사 명의의 2차 대고객 사과문 발표 (action_type: 2)"""
+    default_meta = "[현재 상황] 초기 대응 지연 및 무대응 기간 유튜버 2연타 타격으로 여론 최악 직면."
     
     input_metadata = st.text_area("위기 메타 정보 및 대응 계획", value=default_meta, height=250)
     start_btn = st.button("🚀 파이프라인 가동", type="primary", use_container_width=True)
+    
+    st.divider()
+    
+    # 🎯 Agent I/O 로그 영역 (사이드바 하단)
+    st.header("🔍 Agent I/O 로그")
+    agent_log_container = st.container()
 
 if start_btn:
+    # 초기 상태
     current_state = {
         "input_csv_path": target_csv,
         "crisis_context": input_metadata,
-        "timeline_events": [], 
-        "nvi_forecast": [], 
+        "actual_nvi_history": [],
+        "nvi_baseline_forecast": [],
+        "nvi_mitigated_forecast": [],
+        "strategist_timeline": [],
+        "strategist_draft": "",
         "planner_instructions": "",
         "analyst_draft": "",
-        "strategist_draft": "",
         "draft_report": "", 
         "review_feedback": "", 
         "is_approved": False, 
         "loop_count": 0
     }
 
-    st.subheader("⚙️ 멀티 에이전트 워크플로우 진행 현황")
-    col_viz, col_log = st.columns([1.5, 1])
+    st.subheader("⚙️ 워크플로우 진행 현황")
+    
+    # 플로우 차트(좌) + 파이프라인 리스트(우) — 비슷한 크기
+    col_graph, col_pipeline = st.columns([2, 1])
     
     completed_nodes = set()
+    active_nodes = ["baseline_forecaster"]
+    is_rejected = False
     
-    with col_viz:
+    with col_graph:
+        st.caption("📊 워크플로우 다이어그램")
         graph_placeholder = st.empty()
+    
+    with col_pipeline:
+        st.caption("📋 파이프라인 상태")
+        pipeline_placeholder = st.empty()
+    
+    # 초기 렌더링
+    graph_placeholder.graphviz_chart(
+        render_pipeline_graph(completed_nodes, active_nodes), 
+        use_container_width=True
+    )
+    pipeline_placeholder.markdown(
+        render_pipeline_list(completed_nodes, active_nodes)
+    )
+    
+    # ==========================================
+    # 🚀 파이프라인 실행 루프
+    # ==========================================
+    for event in app_graph.stream(current_state):
+        finished_nodes = list(event.keys())
+        is_rejected = False
         
-    with col_log:
-        with st.status("에이전트 연산 인프라 기동 중...", expanded=True) as status:
+        for node_name, node_output in event.items():
+            current_state.update(node_output)
             
-            # 🎯 1. 시작 직후: 첫 번째 에이전트(analyzer)에 미리 파란불 켜기
-            active_nodes = ["analyzer"]
-            graph_placeholder.graphviz_chart(render_pipeline_graph(completed_nodes, active_nodes), use_container_width=True)
+            # 🎯 사이드바에 Agent I/O 로깅
+            with agent_log_container:
+                with st.expander(f"{'❌' if node_name == 'reviewer' and not node_output.get('is_approved', False) else '✅'} {NODE_LABELS.get(node_name, node_name)}", expanded=False):
+                    for key, value in node_output.items():
+                        if isinstance(value, list) and len(value) > 10:
+                            st.markdown(f"**{key}**: `[{len(value)} items]` min={min(value):.3f}, max={max(value):.3f}")
+                        elif isinstance(value, str) and len(value) > 200:
+                            st.markdown(f"**{key}**:")
+                            st.text(value[:500] + ("..." if len(value) > 500 else ""))
+                        else:
+                            st.markdown(f"**{key}**: `{value}`")
             
-            for event in app_graph.stream(current_state):
-                finished_nodes = list(event.keys()) # '방금 연산이 끝난' 노드들
-                is_rejected = False
-                
-                # 방금 끝난 노드들의 결과를 전체 상태에 업데이트
-                for node_name, node_output in event.items():
-                    current_state.update(node_output)
-                    
-                    if node_name == "reviewer" and not node_output.get("is_approved", False):
-                        st.error(f"❌ **{node_name}** 반려: {node_output.get('review_feedback', '규정 미달')}")
-                        is_rejected = True
+            if node_name == "reviewer" and not node_output.get("is_approved", False):
+                is_rejected = True
+        
+        completed_nodes.update(finished_nodes)
+        
+        # 다음 노드 예측
+        if "reviewer" in finished_nodes:
+            if is_rejected:
+                # 반려 시: 잠시 빨간색 표시 후 planner로 복귀
+                graph_placeholder.graphviz_chart(
+                    render_pipeline_graph(completed_nodes, ["reviewer"], is_rejected=True),
+                    use_container_width=True
+                )
+                pipeline_placeholder.markdown(
+                    render_pipeline_list(completed_nodes, ["reviewer"], is_rejected=True, loop_count=current_state.get("loop_count", 0))
+                )
+                time.sleep(1.5)
+                active_nodes = ["planner"]
+                completed_nodes.difference_update({
+                    "planner", "strategist", "mitigated_forecaster", 
+                    "analyst", "compiler", "reviewer"
+                })
+            else:
+                active_nodes = []
+        else:
+            for finished in finished_nodes:
+                if finished in PIPELINE_ORDER:
+                    idx = PIPELINE_ORDER.index(finished)
+                    if idx + 1 < len(PIPELINE_ORDER):
+                        active_nodes = [PIPELINE_ORDER[idx + 1]]
                     else:
-                        st.success(f"✅ **{node_name}** 오퍼레이션 완료")
-                
-                # 완료 목록에 방금 끝난 녀석들 추가 (초록색으로 변할 준비)
-                completed_nodes.update(finished_nodes)
-                
-                # 🎯 2. 토폴로지 기반 '다음 활성 노드' 예측 로직
-                if "reviewer" in finished_nodes:
-                    if is_rejected:
-                        # 반려 시: 리뷰어를 잠시 빨간색으로 보여준 뒤
-                        graph_placeholder.graphviz_chart(render_pipeline_graph(completed_nodes, ["reviewer"], is_rejected=True), use_container_width=True)
-                        time.sleep(1.5) 
-                        # 기획자(planner)부터 다시 시작하도록 상태 리셋
-                        active_nodes = ["planner"]
-                        completed_nodes.difference_update({"planner", "analyst", "strategist", "compiler", "reviewer"})
-                    else:
-                        active_nodes = [] # 승인 시 종료
-                        
-                elif "compiler" in finished_nodes:
-                    active_nodes = ["reviewer"]
-                    
-                elif "analyst" in finished_nodes or "strategist" in finished_nodes:
-                    # 병렬 처리 분기: 둘 다 끝났으면 compiler로 넘어가고, 하나만 끝났으면 남은 녀석만 파란불 유지
-                    if "analyst" in completed_nodes and "strategist" in completed_nodes:
-                        active_nodes = ["compiler"]
-                    else:
-                        active_nodes = [n for n in ["analyst", "strategist"] if n not in completed_nodes]
-                        
-                elif "planner" in finished_nodes:
-                    active_nodes = ["analyst", "strategist"] # 두 에이전트 동시 가동
-                    
-                elif "forecaster" in finished_nodes:
-                    active_nodes = ["planner"]
-                    
-                elif "analyzer" in finished_nodes:
-                    active_nodes = ["forecaster"]
+                        active_nodes = []
 
-                # 🎯 3. 엔진이 다음 연산에 들어가기 직전(대기 상태), 예측된 다음 노드에 파란불 켜기
-                graph_placeholder.graphviz_chart(render_pipeline_graph(completed_nodes, active_nodes), use_container_width=True)
-                
-            status.update(label="파이프라인 실행 프로세스 종료", state="complete", expanded=False)
-            
-            # 최종 종료 시 다이어그램 전체 완료 상태로 렌더링
-            graph_placeholder.graphviz_chart(render_pipeline_graph(completed_nodes, []), use_container_width=True)
+        # UI 업데이트
+        graph_placeholder.graphviz_chart(
+            render_pipeline_graph(completed_nodes, active_nodes),
+            use_container_width=True
+        )
+        pipeline_placeholder.markdown(
+            render_pipeline_list(completed_nodes, active_nodes, loop_count=current_state.get("loop_count", 0))
+        )
+    
+    # 최종 완료 상태
+    graph_placeholder.graphviz_chart(
+        render_pipeline_graph(completed_nodes, []),
+        use_container_width=True
+    )
+    pipeline_placeholder.markdown(
+        render_pipeline_list(completed_nodes, [], loop_count=current_state.get("loop_count", 0))
+    )
 
     st.divider()
 
-    # 결과 대시보드 데이터 바인딩 로직 (기존과 동일하게 유지)
+    # ==========================================
+    # 📊 결과 대시보드
+    # ==========================================
     if current_state.get("draft_report"):
         try:
             report_data = json.loads(current_state["draft_report"])
             st.header("📊 시뮬레이션 종합 분석 결과")
             
-            col1, col2, col3 = st.columns(3)
+            # 무대응 vs 전략 적용 비교 메트릭
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric(label="위기 경보 등급", value=report_data.get('alert_level', 'UNKNOWN'))
-            col2.metric(label="예상 NVI 최저점", value=f"{report_data.get('expected_nvi_bottom', 0.0)} / 1.0")
-            col3.metric(label="총 연산 루프 횟수", value=f"{current_state.get('loop_count', 0)} 회")
+            col2.metric(label="무대응 시 최저점", value=f"{report_data.get('baseline_nvi_bottom', 0.0):.3f}")
+            col3.metric(label="전략 적용 시 최저점", value=f"{report_data.get('mitigated_nvi_bottom', 0.0):.3f}")
+            col4.metric(
+                label="🛡️ 방어 효과", 
+                value=f"+{report_data.get('defense_effect', 0.0):.3f}p",
+                delta=f"{report_data.get('defense_effect', 0.0):.3f} 포인트 방어"
+            )
 
             st.info(f"**경영진 핵심 요약:** {report_data.get('executive_summary', '')}")
+
+            st.divider()
+
+            # 3-라인 NVI 비교 차트
+            st.subheader("📈 NVI 여론 지수 추이 (실제 vs 무대응 vs 전략 적용)")
+            
+            actual_data = current_state.get("actual_nvi_history", [])
+            baseline_data = current_state.get("nvi_baseline_forecast", [])
+            mitigated_data = current_state.get("nvi_mitigated_forecast", [])
+            
+            if actual_data and baseline_data:
+                total_len = len(actual_data) + len(baseline_data)
+                
+                chart_df = pd.DataFrame({
+                    "시간(Hour)": np.arange(total_len),
+                    "실제 여론 지수(Actual)": actual_data + [None] * len(baseline_data),
+                    "무대응 시나리오(Baseline)": [None] * (len(actual_data) - 1) + [actual_data[-1]] + baseline_data,
+                    "전략 적용 시나리오(Mitigated)": [None] * (len(actual_data) - 1) + [actual_data[-1]] + mitigated_data,
+                }).set_index("시간(Hour)")
+
+                st.line_chart(chart_df, color=["#3b82f6", "#ef4444", "#10b981"])
+                st.caption("※ 🔵 파란색: 실제 여론 | 🔴 빨간색: 무대응(Do Nothing) | 🟢 초록색: 전략 적용(Mitigated)")
+
+            st.divider()
 
             col_left, col_right = st.columns(2)
             with col_left:

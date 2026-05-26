@@ -7,7 +7,6 @@ from langchain_core.documents import Document
 
 # 모듈화된 에이전트 파트 파이프라인 임포트
 from state import PipelineState
-from agents.analyzer import AnalyzerAgent
 from agents.forecaster import ForecasterAgent
 from agents.reporter.planner import PlannerAgent
 from agents.reporter.analyst import AnalystAgent
@@ -28,45 +27,43 @@ def init_infrastructure():
     vector_db = Chroma.from_documents(dummy_docs, embeddings)
     return client, vector_db
 
-# 오리지널 병렬 워크플로우 맵 빌더
+# ==========================================
+# 🔄 고도화된 순차적 파이프라인 워크플로우 빌더
+# 무대응(Baseline) → 전략 수립 → 전략 적용(Mitigated) → Gap 분석
+# ==========================================
 def build_graph(client, vector_db):
-    analyzer = AnalyzerAgent(client, MODEL_NAME)
-    forecaster = ForecasterAgent()
+    # 1. 에이전트 인스턴스 초기화 (Forecaster를 두 가지 목적으로 재사용)
+    baseline_forecaster = ForecasterAgent(mode="baseline")
     planner = PlannerAgent(client, MODEL_NAME)
-    analyst = AnalystAgent(client, MODEL_NAME)
     strategist = StrategistAgent(client, MODEL_NAME, vector_db)
+    mitigated_forecaster = ForecasterAgent(mode="mitigated")
+    analyst = AnalystAgent(client, MODEL_NAME)
     compiler = CompilerAgent(client, MODEL_NAME)
     reviewer = ReviewerAgent(client, MODEL_NAME, vector_db)
 
     workflow = StateGraph(PipelineState)
 
-    # 핸들러 노드 바인딩
-    workflow.add_node("analyzer", analyzer.run)
-    workflow.add_node("forecaster", forecaster.run)
+    # 2. 핸들러 노드 바인딩
+    workflow.add_node("baseline_forecaster", baseline_forecaster.run)
     workflow.add_node("planner", planner.run)
-    workflow.add_node("analyst", analyst.run)
     workflow.add_node("strategist", strategist.run)
+    workflow.add_node("mitigated_forecaster", mitigated_forecaster.run)
+    workflow.add_node("analyst", analyst.run)
     workflow.add_node("compiler", compiler.run)
     workflow.add_node("reviewer", reviewer.run)
 
-    # 순차 및 병렬(Fan-out/Fan-in) 구조 구현
-    workflow.add_edge(START, "analyzer")
-    workflow.add_edge("analyzer", "forecaster")
-    workflow.add_edge("forecaster", "planner")
-    
-    # 기획서 생성 후 분석가와 전략가 비동기 병렬 분기
-    workflow.add_edge("planner", "analyst")
-    workflow.add_edge("planner", "strategist")
-    
-    # 두 작업 완료 후 취합처로 병합
-    workflow.add_edge("analyst", "compiler")
-    workflow.add_edge("strategist", "compiler")
-    
-    workflow.add_edge("compiler", "reviewer")
+    # 3. 순차 인과관계 엣지 연결
+    workflow.add_edge(START, "baseline_forecaster")       # 무대응 예측
+    workflow.add_edge("baseline_forecaster", "planner")   # 기획 지시
+    workflow.add_edge("planner", "strategist")            # 전략 수립 + 타임라인 도출
+    workflow.add_edge("strategist", "mitigated_forecaster")  # 전략 적용 재예측
+    workflow.add_edge("mitigated_forecaster", "analyst")  # Gap 비교 분석
+    workflow.add_edge("analyst", "compiler")              # 보고서 취합
+    workflow.add_edge("compiler", "reviewer")             # CCO 검토
 
-    # 가이드라인 미통과 시 재기획 단계(planner)로 피드백 조건부 라우팅
+    # 4. 가이드라인 미통과 시 재기획 단계(planner)로 피드백 조건부 라우팅
     def should_continue(state: PipelineState):
-        if state["is_approved"] or state["loop_count"] >= 3:
+        if state.get("is_approved") or state.get("loop_count", 0) >= 3:
             return END
         return "planner"
 
