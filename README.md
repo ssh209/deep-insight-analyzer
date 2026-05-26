@@ -1,8 +1,8 @@
-# 🚨 PR Crisis Simulation Dashboard
+# 🚨 Issue Cracker — PR Crisis Simulation Dashboard
 
-**분산형 멀티 에이전트 워크플로우 기반 실시간 여론(NVI) 시뮬레이션 및 위기 대응 보고서 자동 생성 시스템**
+**순차 인과관계 기반 멀티 에이전트 파이프라인으로 무대응(Do Nothing) vs 전략 적용(Mitigated) NVI 시뮬레이션 및 위기 대응 보고서를 자동 생성하는 시스템**
 
-> 기업 PR 위기 상황을 입력하면, 7개의 전문 AI 에이전트가 병렬·순차 파이프라인으로 협업하여 여론 지수(NVI)를 예측하고, 시간대별 대응 전략 보고서를 자동으로 생성합니다.
+> 기업 PR 위기 상황을 입력하면, 7개의 전문 AI 에이전트가 순차 파이프라인으로 협업하여 **무대응 시 여론 최저점**과 **전략 적용 시 방어 효과(ROI)**를 비교 분석하고, 경영진 의사결정을 위한 보고서를 자동 생성합니다.
 
 ---
 
@@ -21,42 +21,51 @@
 
 ## 📌 개요
 
-기업에 PR 위기가 발생했을 때, **초기 대응 전략의 수립 속도**가 여론 회복의 핵심 변수입니다.  
-이 시스템은 LangGraph 기반의 **멀티 에이전트 오케스트레이션**을 통해 다음을 자동화합니다:
+기업에 PR 위기가 발생했을 때, 경영진(C-Level)이 가장 궁금해하는 것은 두 가지입니다:
 
-1. **위기 상황 구조화** — 비정형 텍스트에서 대응 타임라인을 자동 추출
-2. **여론 지수(NVI) 시뮬레이션** — LightGBM 모델로 향후 72시간 NVI 궤적을 동적 예측
-3. **전문가급 보고서 생성** — 데이터 분석 + PR 전략을 병렬로 작성 후 단일 JSON 보고서로 취합
-4. **자동 규정 검토** — RAG 기반 CCO 레드팀이 금칙어/가이드라인 위반을 필터링하고, 미통과 시 자동 재작성
+1. **"가만히 있으면 어떻게 되는데?"** (Do Nothing — Baseline)
+2. **"이 전략대로 하면 얼마나 방어할 수 있는데?"** (Mitigated)
+
+이 시스템은 LangGraph 기반 **순차 인과관계 파이프라인**으로 다음을 자동화합니다:
+
+1. **무대응 NVI 예측** — 아무 대응도 하지 않았을 때 향후 72시간 여론 지수 궤적을 LightGBM으로 시뮬레이션
+2. **전략 수립** — RAG 기반 과거 성공 사례를 참고하여 시간대별 대응 타임라인을 구조화된 JSON으로 도출
+3. **전략 적용 NVI 재예측** — 수립된 전략을 시계열에 주입하여 방어된 NVI 궤적을 재시뮬레이션
+4. **Gap 분석 보고서** — 무대응 vs 전략 적용 간 정량적 차이(방어 효과, ROI)를 분석하여 경영진 보고서 생성
+5. **자동 규정 검토** — RAG 기반 CCO 레드팀이 금칙어/가이드라인 위반을 필터링하고, 미통과 시 자동 재작성
 
 ---
 
 ## 🏗️ 시스템 아키텍처
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Streamlit Dashboard (app.py)                    │
-│         실시간 Graphviz 시각화 + 결과 대시보드 UI                      │
-└─────────────────────┬───────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Engine Layer (engine.py)                        │
-│        인프라 초기화 (Gemini Client, Vector DB) + 그래프 빌드           │
-└─────────────────────┬───────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                 LangGraph StateGraph Pipeline                       │
-│                                                                     │
-│   START → Analyzer → Forecaster → Planner ──┬──→ Analyst    ──┐    │
-│                                              └──→ Strategist ──┤    │
-│                                                                ▼    │
-│                    END ←── Reviewer ←────────── Compiler            │
-│                             │    ▲                                   │
-│                             └────┘ (반려 시 Planner로 피드백 루프)     │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                  Streamlit Dashboard (app.py)                     │
+│    실시간 Graphviz + 리스트 전이 UI + Agent I/O 로그 (사이드바)      │
+└────────────────────────┬─────────────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   Engine Layer (engine.py)                        │
+│      인프라 초기화 (Gemini Client, Vector DB) + 그래프 빌드          │
+└────────────────────────┬─────────────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│              LangGraph StateGraph Pipeline (순차 인과관계)          │
+│                                                                    │
+│  START → Baseline Forecaster → Planner → Strategist               │
+│              → Mitigated Forecaster → Analyst → Compiler           │
+│                  → Reviewer → END                                  │
+│                      │    ▲                                        │
+│                      └────┘ (반려 시 Planner로 피드백 루프, 최대 3회) │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+### 핵심 설계 원칙: 데이터 인과관계 기반 순차 파이프라인
+
+기존의 Fan-out/Fan-in 병렬 구조 대신, **데이터 의존성(Data Dependency)에 따른 순차 실행**을 채택했습니다.
+Forecaster가 두 번 실행(무대응 → 전략 적용)되어야 하므로, 전략가의 산출물이 2차 예측의 입력이 되는 인과관계가 필수적입니다.
 
 ---
 
@@ -64,18 +73,26 @@
 
 | 순서 | 에이전트 | 역할 | 핵심 기술 |
 |:---:|:---|:---|:---|
-| 1 | **Analyzer** (상황 분석기) | 위기 메타 정보에서 향후 대응 타임라인 이벤트를 구조화된 JSON으로 추출 | Gemini 2.5 Pro + Structured Output |
-| 2 | **Forecaster** (NVI 시뮬레이터) | 과거 데이터로 학습한 ML 모델에 시나리오 변곡점을 투영하여 72시간 NVI 예측 | LightGBM Regression |
-| 3 | **Planner** (TF 기획자) | NVI 최저점과 상황을 종합해 하위 에이전트(분석가/전략가)에게 업무 지시서 작성 | Gemini 2.5 Pro |
-| 4-A | **Analyst** (데이터 분석가) | NVI 하락 폭과 위험도를 정량적으로 분석한 초안 작성 | Gemini 2.5 Pro |
-| 4-B | **Strategist** (PR 전략가) | RAG로 과거 성공 사례를 검색하여 시간대별 대응 액션 플랜 수립 | Gemini 2.5 Pro + RAG (ChromaDB) |
-| 5 | **Compiler** (보고서 취합자) | 분석가와 전략가의 초안을 단일 규격 JSON 보고서로 융합 | Gemini 2.5 Pro + Structured Output |
-| 6 | **Reviewer** (CCO 레드팀) | RAG 기반 금칙어 필터링 및 가이드라인 준수 여부 검토. 위반 시 반려 피드백 | Gemini 2.5 Pro + RAG (ChromaDB) |
+| 1 | **Baseline Forecaster** (무대응 예측) | 과거 72시간 데이터로 학습 후, 무대응(action=0) 시 향후 72시간 NVI 예측 | LightGBM + Dynamic Decay |
+| 2 | **Planner** (TF 기획자) | 무대응 최저점을 확인하고 전략가/분석가에게 업무 지시서 작성 | Gemini 2.5 Pro |
+| 3 | **Strategist** (PR 전략가) | RAG 기반 과거 사례 참조 → 구조화된 대응 타임라인(JSON) + 서술형 전략 리포트 이중 출력 | Gemini 2.5 Pro + RAG + Structured Output |
+| 4 | **Mitigated Forecaster** (전략 적용 예측) | 전략가가 도출한 액션 타임라인을 시계열에 주입하여 방어된 NVI 재예측 | LightGBM + Dynamic Decay |
+| 5 | **Analyst** (데이터 분석가) | 무대응 vs 전략 적용 NVI를 비교하여 방어 효과(Gap/ROI) 정량 분석 | Gemini 2.5 Pro |
+| 6 | **Compiler** (보고서 취합자) | 분석가와 전략가의 초안을 단일 규격 JSON 보고서로 융합 | Gemini 2.5 Pro + Structured Output |
+| 7 | **Reviewer** (CCO 레드팀) | RAG 기반 금칙어 필터링 및 가이드라인 준수 검토. 위반 시 반려 피드백 | Gemini 2.5 Pro + RAG |
+
+### Dynamic Decay (동적 감쇠)
+
+Forecaster는 미래 감성 지표에 **동적 감쇠**를 적용합니다:
+- **자연 감쇠**: 시간이 지나면 관심도가 자연 하락 (모멘텀 ×0.6/h, 부정비율 ×0.995/h)
+- **액션 효과**: 기업 대응(Action Type)에 따라 부정비율 감소, 옹호자 증가를 시뮬레이션
+
+이를 통해 무대응 시에도 자연 회복 곡선이 생기고, 전략 적용 시 더 빠른 V자 반등을 시뮬레이션합니다.
 
 ### 워크플로우 특징
 
-- **Fan-out / Fan-in 병렬 처리**: Planner 이후 Analyst와 Strategist가 **동시 병렬 실행**되어 처리 시간 단축
-- **조건부 피드백 루프**: Reviewer가 반려하면 Planner 단계로 되돌아가 재작성 (최대 3회)
+- **이원화 시뮬레이션**: 동일 Forecaster 클래스를 `mode` 파라미터로 2회 실행 (baseline/mitigated)
+- **조건부 피드백 루프**: Reviewer가 반려하면 Planner → Strategist → Mitigated Forecaster → Analyst → Compiler → Reviewer 전체 재실행 (최대 3회)
 - **RAG 기반 규정 준수**: ChromaDB 벡터 스토어에 저장된 사내 가이드라인으로 일관된 품질 보장
 
 ---
@@ -83,32 +100,29 @@
 ## 📁 프로젝트 구조
 
 ```
-Issue-Analayzer/
+Issue_Cracker/
 ├── app.py                          # Streamlit 대시보드 UI (메인 실행)
 ├── main.py                         # CLI 통합 테스트 엔트리포인트
 ├── engine.py                       # 인프라 초기화 + LangGraph 워크플로우 빌드
-├── state.py                        # 공유 상태(PipelineState) 및 스키마 정의
+├── state.py                        # PipelineState 및 Pydantic 스키마 정의
 │
 ├── agents/                         # 에이전트 모듈
-│   ├── analyzer.py                 # Agent 1: 상황 분석 및 타임라인 추출
-│   ├── forecaster.py               # Agent 2: LightGBM 기반 NVI 예측
-│   ├── reviewer.py                 # Agent 6: CCO 레드팀 (RAG 검토)
+│   ├── forecaster.py               # Agent 1/4: LightGBM NVI 예측 (baseline/mitigated)
+│   ├── reviewer.py                 # Agent 7: CCO 레드팀 (RAG 검토)
 │   └── reporter/                   # 보고서 생성 에이전트 그룹
-│       ├── planner.py              # Agent 3: TF 총괄 기획자
-│       ├── analyst.py              # Agent 4-A: 데이터 분석가
-│       ├── strategist.py           # Agent 4-B: PR 전략가 (RAG)
-│       └── compiler.py             # Agent 5: 보고서 취합 및 JSON 포맷팅
-│
-├── common/                         # 공통 유틸리티
-│   └── state.py                    # (레거시) 초기 상태 정의
+│       ├── planner.py              # Agent 2: TF 총괄 기획자
+│       ├── strategist.py           # Agent 3: PR 전략가 (RAG + Structured Output)
+│       ├── analyst.py              # Agent 5: 데이터 분석가 (Gap 분석)
+│       └── compiler.py             # Agent 6: 보고서 취합 및 JSON 포맷팅
 │
 ├── data/                           # 데이터셋
-│   └── pr_crisis_dataset.csv       # PR 위기 시뮬레이션 데이터
+│   └── pr_crisis_dataset.csv       # PR 위기 시뮬레이션 데이터 (72h × 14 features)
 │
 ├── manual/                         # 수동 스크립트
 │   └── make_dataset.py             # 합성 위기 데이터셋 생성기
 │
 ├── requirements.txt                # Python 의존성 목록
+├── CLAUDE.md                       # AI 어시스턴트용 프로젝트 컨텍스트
 └── .gitignore
 ```
 
@@ -142,7 +156,7 @@ Issue-Analayzer/
 
 ```bash
 git clone <repository-url>
-cd Issue-Analayzer
+cd Issue_Cracker
 
 python -m venv venv
 # Windows
@@ -187,23 +201,21 @@ python main.py
 
 1. 좌측 사이드바에서 **데이터셋 경로**와 **위기 메타 정보**를 입력합니다.
 2. **🚀 파이프라인 가동** 버튼을 클릭합니다.
-3. 실시간으로 에이전트 워크플로우 진행 상황을 Graphviz 다이어그램으로 모니터링합니다.
-   - 🟢 초록: 완료된 에이전트
-   - 🔵 파랑: 현재 실행 중인 에이전트
-   - 🔴 빨강: CCO 반려 (피드백 루프 발생)
-4. 파이프라인 완료 후 종합 분석 결과를 대시보드에서 확인합니다:
-   - **위기 경보 등급** (RED / ORANGE / YELLOW)
-   - **예상 NVI 최저점**
-   - **법무 및 PR 리스크 진단**
+3. 메인 화면에서 워크플로우 진행 상황을 모니터링합니다:
+   - **플로우 차트 (좌)**: Graphviz 다이어그램으로 실시간 노드 상태 표시
+   - **파이프라인 리스트 (우)**: 아이콘 전이 방식으로 진행 상태 표시
+   - ⬜ 대기 → 🔵 실행 중 → ✅ 완료 / ❌ 반려
+4. 사이드바 하단의 **Agent I/O 로그**에서 각 에이전트의 입출력을 확인합니다.
+5. 파이프라인 완료 후 종합 분석 결과를 대시보드에서 확인합니다:
+   - **무대응 시 NVI 최저점** vs **전략 적용 시 NVI 최저점**
+   - **🛡️ 방어 효과** (포인트 차이)
+   - **3-라인 NVI 비교 차트** (실제/무대응/전략 적용)
    - **시간대별 액션 플랜**
 
 ### 입력 예시
 
 ```
 [현재 상황] 초기 대응 지연 및 무대응 기간 유튜버 2연타 타격으로 여론 최악 직면.
-[향후 대응 계획]
-- 4시간 뒤: '사실무근이며 깊은 유감이다'라는 1차 해명문 배포 (action_type: 1)
-- 24시간 뒤: 전면 리콜 공표 및 대표이사 명의의 2차 대고객 사과문 발표 (action_type: 2)
 ```
 
 ---
@@ -216,21 +228,30 @@ python main.py
 
 | 시점 | 이벤트 |
 |:---|:---|
-| 2026-06-05 20:00 | 🛑 최초 이슈 발생 (커뮤니티 호소글) |
-| 2026-06-06 10:00 | 💥 유튜버 A 저격 영상 업로드 (14시간 뒤) |
-| 2026-06-06 16:00 | 💣 유튜버 B 확인사살 영상 업로드 (20시간 뒤) |
+| T+0h | 🛑 최초 이슈 발생 (커뮤니티 호소글) |
+| T+10h | 💥 대형 유튜버 A 저격 영상 업로드 |
+| T+25h | 💣 중소형 유튜버 B 확산 영상 업로드 |
+| T+30h | 📝 회사 1차 해명문 배포 |
+| T+48h | 🙇 회사 전면 사과 및 리콜 공표 |
 
-### 주요 피처
+### 주요 피처 (14개 컬럼)
 
 | 컬럼 | 설명 |
 |:---|:---|
-| `SNS_Mentions` | SNS 언급량 |
-| `News_Articles` | 뉴스 기사 수 |
-| `Influencer_Hit` | 인플루언서 타격 여부 (0/1) |
-| `Victim_Claims` | 피해 호소 건수 |
-| `Boycott_Mentions` | 불매 운동 언급량 |
-| `Company_Action` | 기업 대응 상태 (0: 무대응, 1: 1차 입장문, 2: 2차 사과문) |
-| `Actual_NVI` | 여론 지수 (0.1 ~ 1.0, 낮을수록 부정적) |
+| `Datetime` | 시계열 타임스탬프 |
+| `Hours_Since_Start` | 이슈 발생 이후 경과 시간 |
+| `Company_Action_Type` | 기업 대응 상태 (0: 무대응, 1: 1차 입장문, 2: 2차 사과문) |
+| `Influencer_Impact` | 인플루언서 타격 강도 (0/1/2) |
+| `Raw_Total_Mentions` | 총 SNS 언급량 |
+| `Raw_Negative_Mentions` | 부정 언급량 |
+| `Raw_Mockery_Mentions` | 조롱 언급량 |
+| `Raw_Advocate_Mentions` | 옹호 언급량 |
+| `Negative_Ratio` | 부정 비율 (파생 지표) |
+| `Mockery_Index` | 조롱 지수 (파생 지표) |
+| `Advocate_Ratio` | 옹호 비율 (파생 지표) |
+| `SNS_Mentions_Velocity` | 언급량 변화 속도 (파생 지표) |
+| `Negative_Momentum` | 부정 모멘텀 (파생 지표) |
+| `Actual_NVI` | 여론 지수 (0.1~1.0, 낮을수록 부정적) |
 
 데이터셋을 재생성하려면:
 
