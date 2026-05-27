@@ -40,8 +40,10 @@ class ReviewResult(BaseModel):
 # 🏗️ LangGraph 공통 컨텍스트 데이터 버스
 # ==========================================
 class PipelineState(TypedDict):
-    input_csv_path: str
+    train_csv_path: str                 # 학습 데이터 경로 (720h 전체 생애주기)
+    input_csv_path: str                 # 실전 입력 데이터 경로 (72h 현재 위기)
     crisis_context: str
+    crisis_type: str                    # SCCT 위기 유형 ("victim" | "accidental" | "preventable")
     
     # 🎯 예측 결과의 이원화 (무대응 vs 전략 적용)
     actual_nvi_history: list            # 과거 실제 NVI 기록 (차트 렌더링용)

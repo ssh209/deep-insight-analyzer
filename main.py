@@ -13,7 +13,7 @@ if __name__ == "__main__":
     app = build_graph(client, vector_db)
     
     # 2. 테스트 입력 데이터
-    target_csv = "data/pr_crisis_dataset.csv"
+    target_csv = "data/input_crisis_72h.csv"
     
     # 1회차 루프에서 CCO 반려를 확실히 유도하도록 '유감스럽다' 키워드 가상 계획에 주입
     input_metadata = """
@@ -25,8 +25,10 @@ if __name__ == "__main__":
     
     # 3. 초기 상태 (새로운 PipelineState 구조)
     initial_state = {
+        "train_csv_path": "data/pr_crisis_dataset.csv",
         "input_csv_path": target_csv,
         "crisis_context": input_metadata,
+        "crisis_type": "accidental",
         "actual_nvi_history": [],
         "nvi_baseline_forecast": [],
         "nvi_mitigated_forecast": [],
