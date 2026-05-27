@@ -7,6 +7,7 @@ from langchain_core.documents import Document
 
 # 모듈화된 에이전트 파트 파이프라인 임포트
 from state import PipelineState
+from agents.analyzer import AnalyzerAgent
 from agents.forecaster import ForecasterAgent
 from agents.reporter.planner import PlannerAgent
 from agents.reporter.analyst import AnalystAgent
@@ -31,8 +32,9 @@ def init_infrastructure():
 # 🔄 고도화된 순차적 파이프라인 워크플로우 빌더
 # 무대응(Baseline) → 전략 수립 → 전략 적용(Mitigated) → Gap 분석
 # ==========================================
-def build_graph(client, vector_db):
-    # 1. 에이전트 인스턴스 초기화 (Forecaster를 두 가지 목적으로 재사용)
+def build_graph(client, vector_db, db_pool=None):
+    # 1. 에이전트 인스턴스 초기화
+    analyzer = AnalyzerAgent(client, MODEL_NAME, db_pool) if db_pool else None
     baseline_forecaster = ForecasterAgent(mode="baseline")
     planner = PlannerAgent(client, MODEL_NAME)
     strategist = StrategistAgent(client, MODEL_NAME, vector_db)
@@ -44,6 +46,8 @@ def build_graph(client, vector_db):
     workflow = StateGraph(PipelineState)
 
     # 2. 핸들러 노드 바인딩
+    if analyzer:
+        workflow.add_node("analyzer", analyzer.run)
     workflow.add_node("baseline_forecaster", baseline_forecaster.run)
     workflow.add_node("planner", planner.run)
     workflow.add_node("strategist", strategist.run)
@@ -53,7 +57,11 @@ def build_graph(client, vector_db):
     workflow.add_node("reviewer", reviewer.run)
 
     # 3. 순차 인과관계 엣지 연결
-    workflow.add_edge(START, "baseline_forecaster")       # 무대응 예측
+    if analyzer:
+        workflow.add_edge(START, "analyzer")                      # 원본 분석
+        workflow.add_edge("analyzer", "baseline_forecaster")      # 예측
+    else:
+        workflow.add_edge(START, "baseline_forecaster")            # DB 없으면 바로 예측
     workflow.add_edge("baseline_forecaster", "planner")   # 기획 지시
     workflow.add_edge("planner", "strategist")            # 전략 수립 + 타임라인 도출
     workflow.add_edge("strategist", "mitigated_forecaster")  # 전략 적용 재예측
