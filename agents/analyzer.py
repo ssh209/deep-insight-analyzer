@@ -85,6 +85,9 @@ class AnalyzerAgent:
         crisis_id = state["crisis_id"]
         print(f"\n>> [Analyzer] crisis_id={crisis_id} 분석 시작...")
         
+        # 0. crises 상태 업데이트
+        await self._update_crisis_status(crisis_id, 'analyzing')
+        
         # 1. 미분석 댓글 로드
         comments = await self._load_unanalyzed(crisis_id)
         
@@ -94,40 +97,67 @@ class AnalyzerAgent:
             print(f"   [LOAD] 미분석 댓글 {len(comments)}건 로드")
             
             # 2. 배치 감성 분류 + 3회 재시도
-            success, failed = await self._analyze_with_retry(comments)
+            success, failed = await self._analyze_with_retry(comments, crisis_id)
             print(f"   [DONE] 분석 성공 {success}건, 최종 실패 {failed}건")
         
         # 3. Posts 영향력 스코어링
         scored = await self._score_posts(crisis_id)
-        print(f"   [SCORE] Posts 영향력 스코어링: {scored}건 업데이트")
+        print(f"   [SCORE] Posts 영향력 스코어링: {scored}건")
         
         # 4. MV 리프레시 + CSV 내보내기
         csv_path = await self._export_csv(crisis_id)
         print(f"   [EXPORT] CSV: {csv_path}")
+        
+        # 5. crises에 csv 경로 저장
+        await self._finalize_crisis(crisis_id, csv_path)
         
         return {
             "input_csv_path": csv_path,
         }
     
     # ==========================================
+    # Step 0. crises 상태 관리
+    # ==========================================
+    async def _update_crisis_status(self, crisis_id: str, status: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE issue_cracker.crises
+                SET status = $2, updated_at = NOW()
+                WHERE crisis_id = $1
+            """, crisis_id, status)
+    
+    async def _finalize_crisis(self, crisis_id: str, csv_path: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE issue_cracker.crises
+                SET input_csv_path = $2, updated_at = NOW()
+                WHERE crisis_id = $1
+            """, crisis_id, csv_path)
+    
+    # ==========================================
     # Step 1. 미분석 댓글 로드
+    # analysis_results에 아직 없는 댓글만 조회
     # ==========================================
     async def _load_unanalyzed(self, crisis_id: str) -> list[dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT comment_id, body, like_count, reply_count
-                FROM issue_cracker.comments
-                WHERE crisis_id = $1 AND sentiment IS NULL
-                ORDER BY created_at
-            """, crisis_id)
+                SELECT c.comment_id, c.body, c.like_count, c.reply_count
+                FROM issue_cracker.comments c
+                LEFT JOIN issue_cracker.analysis_results ar
+                    ON ar.target_type = 'comment'
+                    AND ar.target_id = c.comment_id
+                    AND ar.model_version = $2
+                WHERE c.crisis_id = $1
+                  AND ar.id IS NULL
+                ORDER BY c.created_at
+            """, crisis_id, self.model_name)
         return [dict(r) for r in rows]
     
     # ==========================================
     # Step 2. LLM 배치 감성 분류 + 재시도
     # ==========================================
-    async def _analyze_with_retry(self, comments: list[dict]) -> tuple[int, int]:
-        """3회 재시도 로직. 최종 실패분은 sentiment=NULL 유지."""
-        # 배치 분할
+    async def _analyze_with_retry(self, comments: list[dict], crisis_id: str) -> tuple[int, int]:
+        """3회 재시도 로직. 최종 실패분은 analysis_results에 미등록 → 언급량에만 포함."""
         batches = [
             comments[i:i + self.BATCH_SIZE] 
             for i in range(0, len(comments), self.BATCH_SIZE)
@@ -142,10 +172,9 @@ class AnalyzerAgent:
             
             failed_batches = []
             
-            # CONCURRENT개씩 동시 실행
             for chunk_start in range(0, len(pending), self.CONCURRENT):
                 chunk = pending[chunk_start:chunk_start + self.CONCURRENT]
-                tasks = [self._call_llm_and_save(batch) for batch in chunk]
+                tasks = [self._call_llm_and_save(batch, crisis_id) for batch in chunk]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 for i, result in enumerate(results):
@@ -159,21 +188,18 @@ class AnalyzerAgent:
             pending = failed_batches
             
             if pending and attempt < self.MAX_RETRIES:
-                # 재시도 전 잠시 대기 (백오프)
                 await asyncio.sleep(2 ** attempt)
         
         total_failed = sum(len(b) for b in pending)
         return total_success, total_failed
     
-    async def _call_llm_and_save(self, batch: list[dict]) -> int:
-        """1개 배치(최대 50건) LLM 호출 → DB 저장. 성공 건수 반환."""
-        # 프롬프트 구성
+    async def _call_llm_and_save(self, batch: list[dict], crisis_id: str) -> int:
+        """1개 배치(최대 50건) LLM 호출 → analysis_results INSERT. 성공 건수 반환."""
         comments_text = "\n".join(
             f"[{c['comment_id']}] {c['body'][:200]}" for c in batch
         )
         prompt = SENTIMENT_PROMPT_TEMPLATE.format(comments_text=comments_text)
         
-        # LLM 호출 (Structured Output)
         response = await asyncio.to_thread(
             self.client.models.generate_content,
             model=self.model_name,
@@ -189,18 +215,19 @@ class AnalyzerAgent:
         result = json.loads(response.text)
         analyses = result["results"]
         
-        # DB 저장
+        # analysis_results에 INSERT
         async with self.pool.acquire() as conn:
             await conn.executemany("""
-                UPDATE issue_cracker.comments
-                SET sentiment       = $2,
-                    is_mockery      = $3,
-                    is_advocate     = $4,
-                    sentiment_score = $5
-                WHERE comment_id = $1
+                INSERT INTO issue_cracker.analysis_results
+                    (crisis_id, target_type, target_id,
+                     sentiment, sentiment_score, is_mockery, is_advocate,
+                     model_version)
+                VALUES ($1, 'comment', $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (target_type, target_id, model_version) DO NOTHING
             """, [
-                (a["comment_id"], a["sentiment"], a["is_mockery"], 
-                 a["is_advocate"], a["sentiment_score"])
+                (crisis_id, a["comment_id"], a["sentiment"],
+                 a["sentiment_score"], a["is_mockery"], a["is_advocate"],
+                 self.model_name)
                 for a in analyses
             ])
         
@@ -208,18 +235,32 @@ class AnalyzerAgent:
     
     # ==========================================
     # Step 3. Posts 영향력 스코어링 (규칙 기반)
+    # → analysis_results에 INSERT
     # ==========================================
     async def _score_posts(self, crisis_id: str) -> int:
         async with self.pool.acquire() as conn:
             result = await conn.execute("""
-                UPDATE issue_cracker.posts SET influence_score = CASE
-                    WHEN author_followers >= 100000 OR view_count >= 500000 THEN 2
-                    WHEN author_followers >= 10000  OR view_count >= 50000  THEN 1
-                    ELSE 0
-                END
-                WHERE crisis_id = $1 AND influence_score IS NULL
+                INSERT INTO issue_cracker.analysis_results
+                    (crisis_id, target_type, target_id, influence_score, model_version)
+                SELECT
+                    p.crisis_id,
+                    'post',
+                    p.post_id,
+                    CASE
+                        WHEN p.author_followers >= 100000 OR p.view_count >= 500000 THEN 2
+                        WHEN p.author_followers >= 10000  OR p.view_count >= 50000  THEN 1
+                        ELSE 0
+                    END,
+                    'rule-based'
+                FROM issue_cracker.posts p
+                LEFT JOIN issue_cracker.analysis_results ar
+                    ON ar.target_type = 'post'
+                    AND ar.target_id = p.post_id
+                    AND ar.model_version = 'rule-based'
+                WHERE p.crisis_id = $1
+                  AND ar.id IS NULL
+                ON CONFLICT (target_type, target_id, model_version) DO NOTHING
             """, crisis_id)
-        # 'UPDATE N' → N 추출
         return int(result.split()[-1]) if result else 0
     
     # ==========================================
@@ -409,15 +450,20 @@ class BatchAnalyzer:
     async def _load_unanalyzed(self, crisis_id: str) -> list[dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT comment_id, body, like_count, reply_count
-                FROM issue_cracker.comments
-                WHERE crisis_id = $1 AND sentiment IS NULL
-                ORDER BY created_at
-            """, crisis_id)
+                SELECT c.comment_id, c.body, c.like_count, c.reply_count
+                FROM issue_cracker.comments c
+                LEFT JOIN issue_cracker.analysis_results ar
+                    ON ar.target_type = 'comment'
+                    AND ar.target_id = c.comment_id
+                    AND ar.model_version = $2
+                WHERE c.crisis_id = $1
+                  AND ar.id IS NULL
+                ORDER BY c.created_at
+            """, crisis_id, self.model_name)
         return [dict(r) for r in rows]
     
     async def _apply_batch_results(self, gcs_output: str, crisis_id: str):
-        """GCS 결과 JSONL 파싱 → DB UPDATE."""
+        """GCS 결과 JSONL 파싱 → analysis_results INSERT."""
         from google.cloud import storage
         
         storage_client = storage.Client(project=self.project_id)
@@ -442,14 +488,15 @@ class BatchAnalyzer:
         if all_analyses:
             async with self.pool.acquire() as conn:
                 await conn.executemany("""
-                    UPDATE issue_cracker.comments
-                    SET sentiment       = $2,
-                        is_mockery      = $3,
-                        is_advocate     = $4,
-                        sentiment_score = $5
-                    WHERE comment_id = $1
+                    INSERT INTO issue_cracker.analysis_results
+                        (crisis_id, target_type, target_id,
+                         sentiment, sentiment_score, is_mockery, is_advocate,
+                         model_version)
+                    VALUES ($1, 'comment', $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (target_type, target_id, model_version) DO NOTHING
                 """, [
-                    (a["comment_id"], a["sentiment"], a["is_mockery"],
-                     a["is_advocate"], a["sentiment_score"])
+                    (crisis_id, a["comment_id"], a["sentiment"],
+                     a["sentiment_score"], a["is_mockery"], a["is_advocate"],
+                     self.model_name)
                     for a in all_analyses
                 ])
