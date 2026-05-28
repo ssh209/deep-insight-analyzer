@@ -107,7 +107,8 @@ NVI(t) = clip( NVI(t-1) - Penalty(t) + Bonus(t) + noise,  0.1,  1.0 )
 
 ┌──────────────────────────────────────────────────────────────────┐
 │                   Data Layer (PostgreSQL)                         │
-│    issue_cracker.posts / comments / hourly_snapshots (MV)         │
+│    crises / posts / comments / analysis_results                   │
+│    hourly_snapshots (Materialized View)                           │
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
@@ -197,11 +198,11 @@ Issue_Cracker/
 │   └── input_crisis_72h.csv        # 72h 실전 입력 데이터 (위기 초기~폭발기)
 │
 ├── sql/                            # PostgreSQL DDL
-│   ├── 001_create_tables.sql       # posts, comments, hourly_snapshots 생성
-│   └── 002_alter_hourly_snapshots.sql  # MV 비율 분모 수정
+│   └── 001_create_tables.sql       # 전체 스키마 (crises/posts/comments/analysis_results/MV)
 │
 ├── manual/                         # 수동 스크립트
-│   └── make_dataset.py             # 합성 위기 데이터셋 생성기 (720h + 72h)
+│   ├── make_dataset.py             # 합성 위기 데이터셋 생성기 (720h + 72h)
+│   └── seed_db.py                  # DB 시드 데이터 생성기 (crises/posts/comments)
 │
 ├── scripts/                        # 유틸리티 스크립트
 │   ├── train_model.py              # LightGBM 사전 학습 & pkl 저장
@@ -332,19 +333,27 @@ python main.py
 
 | 테이블 | 설명 |
 |:---|:---|
-| `issue_cracker.posts` | 원문 (유튜브 영상, 뉴스 기사, 커뮤니티 글) |
-| `issue_cracker.comments` | 댓글 (감성 분석 결과 포함) |
+| `issue_cracker.crises` | 위기 건 마스터 (사용자 입력 단위, 파이프라인 1회 = 1건) |
+| `issue_cracker.posts` | 원문 (유튜브 영상, 뉴스 기사, 커뮤니티 글) — 원본 데이터만 |
+| `issue_cracker.comments` | 댓글 — 원본 데이터만 |
+| `issue_cracker.analysis_results` | 통합 분석 결과 (post/comment 공통, 모델 버전별 관리) |
 | `issue_cracker.hourly_snapshots` | 시간별 집계 Materialized View |
 
-AnalyzerAgent가 `comments`의 감성을 분류하면, `hourly_snapshots`가 ForecasterAgent의 입력 형태로 자동 집계됩니다.
+AnalyzerAgent가 `analysis_results`에 감성 분석 결과를 삽입하면, `hourly_snapshots` MV가 ForecasterAgent의 입력 형태로 자동 집계됩니다.
 
-데이터셋을 재생성하려면:
+데이터 세팅:
 
 ```bash
-# 합성 학습/입력 데이터 생성
+# 1. DB 스키마 생성
+psql -f sql/001_create_tables.sql
+
+# 2. 시드 데이터 삽입 (crises + posts + comments)
+python manual/seed_db.py --dsn postgresql://user:pass@localhost:5432/db
+
+# 3. 합성 학습/입력 데이터 생성
 python manual/make_dataset.py
 
-# LightGBM 모델 사전 학습
+# 4. LightGBM 모델 사전 학습
 python scripts/train_model.py
 ```
 

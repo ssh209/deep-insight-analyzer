@@ -39,15 +39,15 @@ START → Analyzer(asyncpg + LLM 배치 감성 분류)
 | `state.py` | `PipelineState`(TypedDict) 공유 상태 + Pydantic 스키마 |
 | `app.py` | Streamlit 대시보드 — Graphviz + Agent I/O 로그 |
 | `main.py` | CLI 테스트 엔트리포인트 |
-| `agents/analyzer.py` | **감성 분석기** — asyncpg DB + LLM 배치(50건×5병렬) + 3회 재시도 + MV→CSV |
+| `agents/analyzer.py` | **감성 분석기** — asyncpg + LLM 배치(50건×5병렬) + 3회 재시도 + analysis_results INSERT + MV→CSV |
 | `agents/forecaster.py` | LightGBM NVI 168h 예측 — 사전 학습 모델 로드 + SCCT 감쇠 |
 | `agents/reporter/strategist.py` | RAG 기반 1주 이내 대응 타임라인(JSON) + 전략 리포트 |
 | `agents/reporter/planner.py` | Baseline 최저점 참조 업무 지시서 |
 | `agents/reporter/analyst.py` | Baseline vs Mitigated Gap 정량 분석 |
 | `agents/reporter/compiler.py` | CrisisReport JSON 취합 (Structured Output) |
 | `agents/reviewer.py` | RAG 금칙어 필터링 + ReviewResult |
-| `sql/001_create_tables.sql` | PostgreSQL DDL (posts, comments, hourly_snapshots MV) |
-| `sql/002_alter_hourly_snapshots.sql` | MV 비율 분모 수정 마이그레이션 |
+| `sql/001_create_tables.sql` | 전체 DDL (crises/posts/comments/analysis_results/hourly_snapshots MV) |
+| `manual/seed_db.py` | DB 시드 데이터 생성기 (72h 시나리오, 11개 포스트, ~300건 댓글) |
 | `models/nvi_forecaster.pkl` | 사전 학습 LightGBM (720h 기반) |
 | `data/pr_crisis_dataset.csv` | 720h 학습 데이터 (5-페이즈) |
 | `data/input_crisis_72h.csv` | 72h 실전 입력 데이터 |
@@ -80,7 +80,7 @@ class PipelineState(TypedDict):
 - **LLM**: Gemini 2.5 Pro (Vertex AI, `google-genai`)
 - **오케스트레이션**: LangGraph `StateGraph` (async 지원)
 - **ML 예측**: LightGBM + joblib (사전 학습 pkl)
-- **DB**: PostgreSQL + asyncpg (posts/comments/hourly_snapshots)
+- **DB**: PostgreSQL + asyncpg (crises/posts/comments/analysis_results/hourly_snapshots)
 - **배치 분석**: Vertex AI Batch Prediction (초기 대량용, 50% 할인)
 - **RAG**: ChromaDB + HuggingFace `all-MiniLM-L6-v2`
 - **UI**: Streamlit + Graphviz
@@ -106,6 +106,12 @@ UI: 사이드바 `st.selectbox("⚠️ 위기 유형 (SCCT)")` → `crisis_type`
 ## 실행 방법
 
 ```bash
+# DB 스키마 생성
+psql -f sql/001_create_tables.sql
+
+# 시드 데이터
+python manual/seed_db.py --dsn postgresql://...
+
 # 대시보드
 streamlit run app.py
 
@@ -113,10 +119,43 @@ streamlit run app.py
 python main.py
 ```
 
+## DB 스키마 구조
+
+```
+crises (마스터)            posts (원문)            comments (댓글)
+┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+│ crisis_id (PK)   │───│ crisis_id (FK)   │   │ crisis_id (FK)   │
+│ title            │   │ post_id (PK)     │───│ post_id (FK)     │
+│ description      │   │ platform         │   │ comment_id (PK)  │
+│ crisis_type      │   │ title, body      │   │ body             │
+│ status           │   │ author, views    │   │ like_count       │
+└──────────────────┘   └──────────────────┘   └──────────────────┘
+                                  │                     │
+                                  └──────────┬──────────┘
+                                           │
+                              analysis_results (통합 분석)
+                              ┌────────────────────────┐
+                              │ target_type (post|comment) │
+                              │ target_id                  │
+                              │ sentiment, score            │
+                              │ is_mockery, is_advocate     │
+                              │ influence_score             │
+                              │ model_version               │
+                              │ UNIQUE(type, id, version)   │
+                              └────────────────────────┘
+                                           │
+                              hourly_snapshots (MV, LEFT JOIN)
+```
+
+- 원본 데이터(posts/comments)와 분석 결과(analysis_results)가 완전 분리
+- 동일 댓글을 다른 모델로 재분석해도 `UNIQUE(target_type, target_id, model_version)`로 공존
+- 분석 실패 댓글은 analysis_results에 없음 → MV의 `LEFT JOIN`으로 `total_mentions`에만 포함
+
 ## 주의사항
 
 - RAG 벡터 DB는 하드코딩된 2개 더미 Document만 포함
 - GCP 프로젝트 ID가 engine.py에 하드코딩되어 있음
 - `models/nvi_forecaster.pkl` 변경 시 `scripts/train_model.py` 재실행 필요
 - AnalyzerAgent는 `db_pool`이 없으면 생략됨 (기존 CSV 직접 입력 호환)
-- 감성 분석 3회 재시도 후 실패분은 sentiment=NULL 유지 (언급량에만 포함)
+- 감성 분석 3회 재시도 후 실패분은 analysis_results에 미등록 (언급량에만 포함)
+- `ON CONFLICT DO NOTHING`으로 먱등성 보장 (같은 모델로 재실행해도 중복 없음)
