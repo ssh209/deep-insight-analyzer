@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+.git/
+.env
+*.pyc
+*.pyo
+.gitignore
+requirements-lock.txt
+manual/
+scripts/
+.vscode/
+.qodo/
+*.md
+!README.md

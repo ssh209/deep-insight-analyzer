@@ -5,6 +5,9 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
+# 중앙 설정 모듈
+from config import GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL
+
 # 모듈화된 에이전트 파트 파이프라인 임포트
 from state import PipelineState
 from agents.analyzer import AnalyzerAgent
@@ -15,11 +18,11 @@ from agents.reporter.strategist import StrategistAgent
 from agents.reporter.compiler import CompilerAgent
 from agents.reviewer import ReviewerAgent
 
-MODEL_NAME = "gemini-2.5-pro"
+MODEL_NAME = GEMINI_MODEL
 
 # 인프라 컴포넌트 초기화 함수
 def init_infrastructure():
-    client = genai.Client(vertexai=True, project="deep-insight-496705", location="global")
+    client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location=GCP_LOCATION)
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     dummy_docs = [
         Document(page_content="[과거사례] 2024년 배터리 이슈 당시, 2차 입장문(적극적 사과) 발표 후 24시간 내 NVI 반등 시작. 초기 무대응 시 NVI 0.4 이하로 추락.", metadata={"type": "history"}),

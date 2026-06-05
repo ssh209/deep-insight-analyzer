@@ -1,2 +1,6 @@
 venv/
 __pycache__/
+requirements-lock.txt
+.env
+*.pem
+deploy/*.json
