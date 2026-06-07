@@ -1,20 +1,35 @@
 -- ==========================================
--- Issue Cracker - 전체 스키마 (Full DDL)
--- 기존 테이블 DROP 후 재생성
+-- Issue Cracker — Schema DDL (간소화 버전)
+-- PostgreSQL 16+ / pgvector 확장 필요
+--
+-- 테이블 구성 (5개):
+--   1. issues             — 사용자 입력 단위 (분석 요청)
+--   2. posts              — 원문 (전체 수집, issue 독립)
+--   3. comments           — 댓글 (전체 수집, issue 독립)
+--   4. analysis_results   — 감성 분류 결과 (issue 연결)
+--   5. pipeline_runs      — 파이프라인 실행 이력 & 결과
+--
+-- 설계 원칙:
+--   - posts/comments는 이슈와 무관하게 전체 수집
+--   - analysis_results만 issue_id로 연결 (어떤 이슈 관점의 분석인지)
+--   - posts/comments에 pgvector 임베딩 → 이슈별 관련 콘텐츠 검색
 -- ==========================================
 
-DROP MATERIALIZED VIEW IF EXISTS issue_cracker.hourly_snapshots;
+-- 🗑️ DROP (역순)
+DROP TABLE IF EXISTS issue_cracker.pipeline_runs;
 DROP TABLE IF EXISTS issue_cracker.analysis_results;
 DROP TABLE IF EXISTS issue_cracker.comments;
 DROP TABLE IF EXISTS issue_cracker.posts;
-DROP TABLE IF EXISTS issue_cracker.crises;
+DROP TABLE IF EXISTS issue_cracker.issues;
+
 DROP TYPE IF EXISTS issue_cracker.content_type;
 DROP TYPE IF EXISTS issue_cracker.platform_type;
 
 CREATE SCHEMA IF NOT EXISTS issue_cracker;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ==========================================
--- ENUM
+-- 📦 ENUM Types
 -- ==========================================
 CREATE TYPE issue_cracker.platform_type AS ENUM (
     'youtube', 'twitter', 'community', 'news', 'instagram', 'tiktok'
@@ -24,34 +39,30 @@ CREATE TYPE issue_cracker.content_type AS ENUM (
     'video', 'article', 'post', 'tweet', 'reel', 'short'
 );
 
+
 -- ==========================================
--- 🚨 Crises (위기 건) - 사용자 입력 단위
--- 파이프라인 1회 실행 = 1개 crisis
+-- [1] 🚨 Issues — 사용자 입력 단위
 -- ==========================================
-CREATE TABLE issue_cracker.crises (
-    crisis_id       TEXT        PRIMARY KEY,
-    title           TEXT        NOT NULL,
-    description     TEXT,                           -- → PipelineState.crisis_context
-    crisis_type     TEXT        NOT NULL
-                    CHECK (crisis_type IN ('victim', 'accidental', 'preventable')),
+CREATE TABLE issue_cracker.issues (
+    issue_id        TEXT        PRIMARY KEY,
+    user_input      TEXT        NOT NULL,               -- 사용자가 입력한 위기 상황 설명
+    issue_type      TEXT        NOT NULL                -- SCCT 위기 유형
+                    CHECK (issue_type IN ('victim', 'accidental', 'preventable')),
     status          TEXT        NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'analyzing', 'resolved', 'archived')),
 
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      TEXT,
 
-    train_csv_path  TEXT,
-    input_csv_path  TEXT,
-    extra           JSONB      DEFAULT '{}'
+    extra           JSONB       DEFAULT '{}'
 );
 
+
 -- ==========================================
--- 📄 Posts (원문)
+-- [2] 📄 Posts — 원문 (전체 수집, issue 독립)
 -- ==========================================
 CREATE TABLE issue_cracker.posts (
     post_id         TEXT        PRIMARY KEY,
-    crisis_id       TEXT        NOT NULL REFERENCES issue_cracker.crises(crisis_id),
     created_at      TIMESTAMPTZ NOT NULL,
     collected_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -64,24 +75,27 @@ CREATE TABLE issue_cracker.posts (
 
     author_id       TEXT        NOT NULL,
     author_name     TEXT,
-    author_followers INTEGER   DEFAULT 0,
+    author_followers INTEGER    DEFAULT 0,
 
-    view_count      INTEGER    DEFAULT 0,
-    like_count      INTEGER    DEFAULT 0,
-    share_count     INTEGER    DEFAULT 0,
-    comment_count   INTEGER    DEFAULT 0,
+    view_count      INTEGER     DEFAULT 0,
+    like_count      INTEGER     DEFAULT 0,
+    share_count     INTEGER     DEFAULT 0,
+    comment_count   INTEGER     DEFAULT 0,
 
-    extra           JSONB      DEFAULT '{}'
+    -- pgvector 임베딩 (title + body)
+    embedding       vector(384),                        -- all-MiniLM-L6-v2 차원
+
+    extra           JSONB       DEFAULT '{}'
 );
 
+
 -- ==========================================
--- 💬 Comments (댓글)
+-- [3] 💬 Comments — 댓글 (전체 수집, issue 독립)
 -- ==========================================
 CREATE TABLE issue_cracker.comments (
     comment_id          TEXT        PRIMARY KEY,
-    post_id             TEXT        NOT NULL REFERENCES issue_cracker.posts(post_id),
-    crisis_id           TEXT        NOT NULL REFERENCES issue_cracker.crises(crisis_id),
-    parent_comment_id   TEXT        REFERENCES issue_cracker.comments(comment_id),
+    post_id             TEXT        NOT NULL,
+    parent_comment_id   TEXT,
     created_at          TIMESTAMPTZ NOT NULL,
     collected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -91,24 +105,28 @@ CREATE TABLE issue_cracker.comments (
     author_name         TEXT,
     author_followers    INTEGER,
 
-    like_count          INTEGER    DEFAULT 0,
-    reply_count         INTEGER    DEFAULT 0,
+    like_count          INTEGER     DEFAULT 0,
+    reply_count         INTEGER     DEFAULT 0,
 
-    extra               JSONB      DEFAULT '{}'
+    -- pgvector 임베딩 (body)
+    embedding           vector(384),                    -- all-MiniLM-L6-v2 차원
+
+    extra               JSONB       DEFAULT '{}'
 );
 
+
 -- ==========================================
--- 📊 Analysis Results (통합 분석 결과)
--- post / comment 공통
+-- [4] 📊 Analysis Results — 감성 분류 + 영향력 스코어
+--     issue_id 연결: 같은 댓글도 이슈마다 다른 관점으로 분석 가능
 -- ==========================================
 CREATE TABLE issue_cracker.analysis_results (
     id              BIGSERIAL   PRIMARY KEY,
-    crisis_id       TEXT        NOT NULL REFERENCES issue_cracker.crises(crisis_id),
+    issue_id        TEXT        NOT NULL,
 
     target_type     TEXT        NOT NULL CHECK (target_type IN ('post', 'comment')),
     target_id       TEXT        NOT NULL,
 
-    -- 공통
+    -- 감성 분류
     sentiment       TEXT        CHECK (sentiment IN ('positive', 'negative', 'neutral')),
     sentiment_score REAL,
 
@@ -123,60 +141,93 @@ CREATE TABLE issue_cracker.analysis_results (
     model_version   TEXT,
     analyzed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE (target_type, target_id, model_version)
+    UNIQUE (issue_id, target_type, target_id, model_version)
 );
 
--- ==========================================
--- 📋 hourly_snapshots (Materialized View)
--- ==========================================
-CREATE MATERIALIZED VIEW issue_cracker.hourly_snapshots AS
-SELECT
-    c.crisis_id,
-    date_trunc('hour', c.created_at)                            AS hour_bucket,
-
-    COUNT(*)                                                    AS total_mentions,
-    COUNT(ar.id)                                                AS analyzed_count,
-
-    COUNT(*) FILTER (WHERE ar.sentiment = 'negative')           AS negative_mentions,
-    COUNT(*) FILTER (WHERE ar.is_mockery = TRUE)                AS mockery_mentions,
-    COUNT(*) FILTER (WHERE ar.is_advocate = TRUE)               AS advocate_mentions,
-
-    ROUND(
-        COUNT(*) FILTER (WHERE ar.sentiment = 'negative')::NUMERIC
-        / NULLIF(COUNT(ar.id), 0), 3
-    )                                                           AS negative_ratio,
-    ROUND(
-        COUNT(*) FILTER (WHERE ar.is_mockery = TRUE)::NUMERIC
-        / NULLIF(COUNT(ar.id), 0), 3
-    )                                                           AS mockery_index,
-    ROUND(
-        COUNT(*) FILTER (WHERE ar.is_advocate = TRUE)::NUMERIC
-        / NULLIF(COUNT(ar.id), 0), 3
-    )                                                           AS advocate_ratio,
-
-    COALESCE(
-        MAX(par.influence_score) FILTER (WHERE par.influence_score IS NOT NULL), 0
-    )                                                           AS influencer_impact
-
-FROM issue_cracker.comments c
-LEFT JOIN issue_cracker.analysis_results ar
-    ON ar.target_type = 'comment' AND ar.target_id = c.comment_id
-JOIN issue_cracker.posts p ON c.post_id = p.post_id
-LEFT JOIN issue_cracker.analysis_results par
-    ON par.target_type = 'post' AND par.target_id = p.post_id
-GROUP BY c.crisis_id, date_trunc('hour', c.created_at)
-ORDER BY c.crisis_id, hour_bucket;
 
 -- ==========================================
--- 📊 인덱스
+-- [5] 🔄 Pipeline Runs — 파이프라인 실행 이력 & 결과
 -- ==========================================
-CREATE INDEX idx_crises_status          ON issue_cracker.crises (status, created_at DESC);
-CREATE INDEX idx_posts_crisis_time      ON issue_cracker.posts (crisis_id, created_at);
-CREATE INDEX idx_posts_platform         ON issue_cracker.posts (platform, created_at);
-CREATE INDEX idx_comments_post          ON issue_cracker.comments (post_id, created_at);
-CREATE INDEX idx_comments_crisis_time   ON issue_cracker.comments (crisis_id, created_at);
-CREATE INDEX idx_analysis_crisis_type   ON issue_cracker.analysis_results (crisis_id, target_type);
-CREATE INDEX idx_analysis_sentiment     ON issue_cracker.analysis_results (crisis_id, target_type, sentiment)
+CREATE TABLE issue_cracker.pipeline_runs (
+    run_id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    issue_id            TEXT        NOT NULL,
+
+    -- 입력 파라미터
+    issue_type          TEXT        NOT NULL,
+    crisis_context      TEXT,
+
+    -- 실행 상태
+    status              TEXT        NOT NULL DEFAULT 'running'
+                        CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+    loop_count          SMALLINT    DEFAULT 0,
+
+    -- 에이전트 산출물
+    planner_instructions    TEXT,
+    strategist_draft        TEXT,
+    strategist_timeline     JSONB,
+    analyst_draft           TEXT,
+    draft_report            JSONB,
+    review_feedback         TEXT,
+    is_approved             BOOLEAN,
+
+    -- NVI 예측 결과
+    actual_nvi_history      JSONB,
+    nvi_baseline_forecast   JSONB,
+    nvi_mitigated_forecast  JSONB,
+
+    -- 요약 지표
+    alert_level             TEXT,
+    baseline_nvi_bottom     REAL,
+    mitigated_nvi_bottom    REAL,
+    defense_effect          REAL,
+
+    -- 타임스탬프
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ
+);
+
+
+-- ==========================================
+-- 📊 Indexes
+-- ==========================================
+
+-- issues
+CREATE INDEX idx_issues_status
+    ON issue_cracker.issues (status, created_at DESC);
+
+-- posts
+CREATE INDEX idx_posts_platform_time
+    ON issue_cracker.posts (platform, created_at DESC);
+CREATE INDEX idx_posts_collected
+    ON issue_cracker.posts (collected_at DESC);
+
+-- posts: pgvector (코사인 유사도 검색)
+CREATE INDEX idx_posts_embedding
+    ON issue_cracker.posts
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- comments
+CREATE INDEX idx_comments_post
+    ON issue_cracker.comments (post_id, created_at);
+CREATE INDEX idx_comments_collected
+    ON issue_cracker.comments (collected_at DESC);
+
+-- comments: pgvector (코사인 유사도 검색)
+CREATE INDEX idx_comments_embedding
+    ON issue_cracker.comments
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- analysis_results
+CREATE INDEX idx_analysis_issue_type
+    ON issue_cracker.analysis_results (issue_id, target_type);
+CREATE INDEX idx_analysis_sentiment
+    ON issue_cracker.analysis_results (issue_id, target_type, sentiment)
     WHERE sentiment IS NOT NULL;
-CREATE UNIQUE INDEX idx_hourly_snapshots_pk
-    ON issue_cracker.hourly_snapshots (crisis_id, hour_bucket);
+
+-- pipeline_runs
+CREATE INDEX idx_pipeline_runs_issue
+    ON issue_cracker.pipeline_runs (issue_id, started_at DESC);
+CREATE INDEX idx_pipeline_runs_status
+    ON issue_cracker.pipeline_runs (status, started_at DESC);

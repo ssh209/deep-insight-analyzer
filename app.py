@@ -12,8 +12,8 @@ from engine import init_infrastructure, build_graph
 # ==========================================
 @st.cache_resource
 def setup_backend():
-    client, vector_db = init_infrastructure()
-    app_graph = build_graph(client, vector_db)
+    client, vector_db, embeddings = init_infrastructure()
+    app_graph = build_graph(client, vector_db, embeddings)
     return app_graph
 
 app_graph = setup_backend()
@@ -22,11 +22,14 @@ app_graph = setup_backend()
 # 🔄 파이프라인 노드 정의 (공통 상수)
 # ==========================================
 PIPELINE_ORDER = [
+    "query_builder", "retriever",
     "baseline_forecaster", "planner", "strategist", 
     "mitigated_forecaster", "analyst", "compiler", "reviewer"
 ]
 
 NODE_LABELS = {
+    "query_builder": "Query Builder",
+    "retriever": "Data Retriever",
     "baseline_forecaster": "Baseline Forecaster",
     "planner": "Report Planner",
     "strategist": "Strategist",
@@ -178,10 +181,17 @@ with st.sidebar:
 if start_btn:
     # 초기 상태
     current_state = {
+        "issue_id": "",
         "train_csv_path": "data/pr_crisis_dataset.csv",
         "input_csv_path": target_csv,
         "crisis_context": input_metadata,
         "crisis_type": selected_crisis_type,
+        "search_keywords": [],
+        "search_queries": [],
+        "search_embeddings": [],
+        "search_time_hint": "",
+        "retrieved_post_ids": [],
+        "retrieved_comment_count": 0,
         "actual_nvi_history": [],
         "nvi_baseline_forecast": [],
         "nvi_mitigated_forecast": [],

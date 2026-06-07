@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pandas as pd
 import joblib
 from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
 
 TRAIN_CSV = "data/pr_crisis_dataset.csv"
 MODEL_DIR = "models"
@@ -57,7 +58,7 @@ def train_and_save():
     
     # 간단한 검증
     y_pred = model.predict(X_train)
-    from sklearn.metrics import mean_absolute_error, r2_score
+
     print(f"\n-- Train Set Metrics --")
     print(f"   MAE:  {mean_absolute_error(y_train, y_pred):.4f}")
     print(f"   R2:   {r2_score(y_train, y_pred):.4f}")

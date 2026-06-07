@@ -14,6 +14,8 @@ issue_cracker 스키마에 맞는 더미 데이터를 PostgreSQL에 직접 삽�
 사용법:
   python manual/seed_db.py --dsn postgresql://user:pass@localhost:5432/dbname
 """
+import sys
+import os
 import asyncio
 import argparse
 import random
@@ -21,18 +23,24 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
+from sentence_transformers import SentenceTransformer
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import EMBEDDING_MODEL
+
+PASSAGE_PREFIX = "passage: "
 
 # ==========================================
 # 시나리오 정의
 # ==========================================
-CRISIS_ID = "crisis-battery-001"
-CRISIS_TITLE = "XX전자 배터리 발화 은폐 의혹"
-CRISIS_DESC = (
+ISSUE_ID = "issue-battery-001"
+ISSUE_TITLE = "XX전자 배터리 발화 은폐 의혹"
+ISSUE_USER_INPUT = (
     "XX전자의 스마트폰 배터리가 충전 중 발화하는 사례가 3건 연속 접수되었으나, "
     "기업이 이를 2개월간 은폐한 정황이 내부 문건을 통해 폭로됨. "
     "커뮤니티 호소글에서 시작, 대형 유튜버 저격으로 여론 폭발."
 )
-CRISIS_TYPE = "preventable"
+ISSUE_TYPE = "preventable"
 
 KST = timezone(timedelta(hours=9))
 START_TIME = datetime(2025, 6, 1, 9, 0, 0, tzinfo=KST)
@@ -163,7 +171,6 @@ def generate_comments(posts_data: list[dict]) -> list[dict]:
             comments.append({
                 "comment_id": f"cmt-{uuid.uuid4().hex[:12]}",
                 "post_id": post["post_id"],
-                "crisis_id": CRISIS_ID,
                 "created_at": created_at,
                 "body": body,
                 "author_id": f"anon_{random.randint(1000, 9999)}",
@@ -183,18 +190,18 @@ async def seed(dsn: str):
     pool = await asyncpg.create_pool(dsn, min_size=2, max_size=5)
     
     async with pool.acquire() as conn:
-        # 1. Crisis
+        # 1. Issue
         await conn.execute("""
-            INSERT INTO issue_cracker.crises
-                (crisis_id, title, description, crisis_type, status, train_csv_path)
-            VALUES ($1, $2, $3, $4, 'active', 'data/pr_crisis_dataset.csv')
-            ON CONFLICT (crisis_id) DO UPDATE SET
-                description = EXCLUDED.description,
+            INSERT INTO issue_cracker.issues
+                (issue_id, user_input, issue_type, status)
+            VALUES ($1, $2, $3, 'active')
+            ON CONFLICT (issue_id) DO UPDATE SET
+                user_input = EXCLUDED.user_input,
                 updated_at = NOW()
-        """, CRISIS_ID, CRISIS_TITLE, CRISIS_DESC, CRISIS_TYPE)
-        print(f"✅ Crisis 생성: {CRISIS_ID}")
+        """, ISSUE_ID, ISSUE_USER_INPUT, ISSUE_TYPE)
+        print(f"✅ Issue 생성: {ISSUE_ID}")
         
-        # 2. Posts
+        # 2. Posts (issue 독립 — issue_id 컬럼 없음)
         posts_data = []
         for i, p in enumerate(POSTS):
             hour, platform, ctype, title, author_id, author_name, followers, views = p
@@ -203,12 +210,12 @@ async def seed(dsn: str):
             
             await conn.execute("""
                 INSERT INTO issue_cracker.posts
-                    (post_id, crisis_id, created_at, platform, content_type,
+                    (post_id, created_at, platform, content_type,
                      title, author_id, author_name, author_followers,
                      view_count, like_count, comment_count)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (post_id) DO NOTHING
-            """, post_id, CRISIS_ID, created_at, platform, ctype,
+            """, post_id, created_at, platform, ctype,
                  title, author_id, author_name, followers,
                  views, int(views * random.uniform(0.02, 0.08)), 0)
             
@@ -216,18 +223,18 @@ async def seed(dsn: str):
         
         print(f"✅ Posts 생성: {len(POSTS)}건")
         
-        # 3. Comments
+        # 3. Comments (issue 독립 — issue_id 컬럼 없음)
         comments = generate_comments(posts_data)
         
         for c in comments:
             await conn.execute("""
                 INSERT INTO issue_cracker.comments
-                    (comment_id, post_id, crisis_id, created_at,
+                    (comment_id, post_id, created_at,
                      body, author_id, author_name, author_followers,
                      like_count, reply_count)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (comment_id) DO NOTHING
-            """, c["comment_id"], c["post_id"], c["crisis_id"], c["created_at"],
+            """, c["comment_id"], c["post_id"], c["created_at"],
                  c["body"], c["author_id"], c["author_name"], c["author_followers"],
                  c["like_count"], c["reply_count"])
         
@@ -238,31 +245,84 @@ async def seed(dsn: str):
             FROM (
                 SELECT post_id, COUNT(*) as cnt
                 FROM issue_cracker.comments
-                WHERE crisis_id = $1
                 GROUP BY post_id
             ) sub
             WHERE p.post_id = sub.post_id
-        """, CRISIS_ID)
+        """)
         
         print(f"✅ Comments 생성: {len(comments)}건")
+    
+    # ==========================================
+    # 4. 임베딩 생성 (E5: passage: prefix)
+    # ==========================================
+    print(f"\n>> 임베딩 모델 로드: {EMBEDDING_MODEL}")
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    print(f"   디바이스: {model.device}")
+    
+    async with pool.acquire() as conn:
+        # 4-1. Posts 임베딩
+        post_rows = await conn.fetch("""
+            SELECT post_id, title, body FROM issue_cracker.posts WHERE embedding IS NULL
+        """)
+        if post_rows:
+            post_texts = [
+                PASSAGE_PREFIX + " ".join(filter(None, [r["title"], (r["body"] or "")[:500]]))
+                for r in post_rows
+            ]
+            post_embs = model.encode(post_texts, normalize_embeddings=True, show_progress_bar=False)
+            for row, emb in zip(post_rows, post_embs):
+                vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
+                await conn.execute("""
+                    UPDATE issue_cracker.posts SET embedding = $2::vector WHERE post_id = $1
+                """, row["post_id"], vec_str)
+            print(f"✅ Posts 임베딩 생성: {len(post_rows)}건")
         
-        # 4. 요약 통계
+        # 4-2. Comments 임베딩
+        comment_rows = await conn.fetch("""
+            SELECT comment_id, body FROM issue_cracker.comments WHERE embedding IS NULL
+        """)
+        if comment_rows:
+            comment_texts = [PASSAGE_PREFIX + (r["body"] or "")[:500] for r in comment_rows]
+            # 배치 처리 (100건씩)
+            batch_size = 100
+            for i in range(0, len(comment_rows), batch_size):
+                batch_rows = comment_rows[i:i + batch_size]
+                batch_texts = comment_texts[i:i + batch_size]
+                batch_embs = model.encode(batch_texts, normalize_embeddings=True, show_progress_bar=False)
+                for row, emb in zip(batch_rows, batch_embs):
+                    vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
+                    await conn.execute("""
+                        UPDATE issue_cracker.comments SET embedding = $2::vector WHERE comment_id = $1
+                    """, row["comment_id"], vec_str)
+                print(f"   Comments 임베딩 [{i+1}~{i+len(batch_rows)}] 완료")
+            print(f"✅ Comments 임베딩 생성: {len(comment_rows)}건")
+    
+    # ==========================================
+    # 5. 요약 통계
+    # ==========================================
+    async with pool.acquire() as conn:
         stats = await conn.fetchrow("""
             SELECT 
                 COUNT(*) as total_comments,
                 MIN(created_at) as earliest,
                 MAX(created_at) as latest
             FROM issue_cracker.comments
-            WHERE crisis_id = $1
-        """, CRISIS_ID)
-        
-        print(f"\n📊 시드 데이터 요약:")
-        print(f"   Crisis: {CRISIS_TITLE} ({CRISIS_TYPE})")
-        print(f"   Posts:  {len(POSTS)}건")
-        print(f"   Comments: {stats['total_comments']}건")
-        print(f"   기간: {stats['earliest']} ~ {stats['latest']}")
-        print(f"\n   ⚠️  analysis_results는 비어 있습니다.")
-        print(f"   → AnalyzerAgent 실행 시 감성 분석 결과가 채워집니다.")
+        """)
+        emb_stats = await conn.fetchrow("""
+            SELECT
+                (SELECT COUNT(*) FROM issue_cracker.posts WHERE embedding IS NOT NULL) as posts_embedded,
+                (SELECT COUNT(*) FROM issue_cracker.comments WHERE embedding IS NOT NULL) as comments_embedded
+        """)
+    
+    print(f"\n📊 시드 데이터 요약:")
+    print(f"   Issue: {ISSUE_TITLE} ({ISSUE_TYPE})")
+    print(f"   Posts:  {len(POSTS)}건 (임베딩: {emb_stats['posts_embedded']}건)")
+    print(f"   Comments: {stats['total_comments']}건 (임베딩: {emb_stats['comments_embedded']}건)")
+    print(f"   기간: {stats['earliest']} ~ {stats['latest']}")
+    print(f"   모델: {EMBEDDING_MODEL}")
+    print(f"\n   ⚠️  analysis_results는 비어 있습니다.")
+    print(f"   → AnalyzerAgent 실행 시 issue_id 기준으로 감성 분석 결과가 채워집니다.")
+    print(f"\n   ✅ pgVector 검색 준비 완료!")
     
     await pool.close()
 

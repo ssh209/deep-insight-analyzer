@@ -25,6 +25,17 @@ INPUT_CSV_PATH = os.environ.get("INPUT_CSV_PATH", "data/input_crisis_72h.csv")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # ==========================================
+# 🔤 Embedding Model
+# ==========================================
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+
+# ==========================================
+# 🔮 Forecaster Model
+# ==========================================
+FORECASTER_MODEL = os.environ.get("FORECASTER_MODEL", "lightgbm")  # "lightgbm" | "tft" | "moirai" | "arima"
+
+# ==========================================
 # 🌐 Streamlit
 # ==========================================
 STREAMLIT_PORT = int(os.environ.get("STREAMLIT_PORT", "8501"))
