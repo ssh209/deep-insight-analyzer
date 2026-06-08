@@ -31,12 +31,13 @@ async def create_db_pool() -> Optional[asyncpg.Pool]:
 
     try:
         # SSL 컨텍스트 설정 (Neon, Supabase 등 클라우드 DB 필수)
-        ssl_context = None
         if DB_SSL:
             ssl_context = ssl.create_default_context()
             # 클라우드 DB는 자체 서명 인증서를 사용하므로 검증 완화
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
+        else:
+            ssl_context = False
 
         pool = await asyncpg.create_pool(
             dsn=DATABASE_URL,
