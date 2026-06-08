@@ -96,15 +96,23 @@ class AnalyzerAgent:
     
     DB 의존성 없음. Retriever가 state에 담은 메모리 데이터만 소비.
     LangGraph 노드로 사용 시 run()이 async로 호출됩니다.
+    
+    듀얼 모델 전략:
+      - model_name (Flash): 대량 감성 분류 배치 → 비용 최적화
+      - deep_model_name (Pro): 테마 클러스터링, KOL 성향 분석 → 품질 우선
     """
     
     BATCH_SIZE = 50         # 1회 LLM 호출당 댓글 수
     CONCURRENT = 5          # 동시 배치 수
     MAX_RETRIES = 3         # 최대 재시도 횟수
     
-    def __init__(self, client, model_name: str, db_pool=None):
+    def __init__(self, client, model_name: str, db_pool=None,
+                 deep_model_name: str = None):
         self.client = client
-        self.model_name = model_name
+        self.model_name = model_name            # Flash: 감성 분류 배치
+        self.deep_model_name = (                # Pro: 테마/KOL 심층 분석
+            deep_model_name or model_name
+        )
         self.pool = db_pool     # asyncpg.Pool (INSERT 전용, SELECT는 Retriever에서)
     
     # ==========================================
@@ -525,7 +533,7 @@ class AnalyzerAgent:
         try:
             res = await asyncio.to_thread(
                 self.client.models.generate_content,
-                model=self.model_name,
+                model=self.deep_model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -689,7 +697,7 @@ stance 기준:
         try:
             res = await asyncio.to_thread(
                 self.client.models.generate_content,
-                model=self.model_name,
+                model=self.deep_model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",

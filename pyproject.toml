@@ -1,0 +1,64 @@
+package-mode = false
+[project]
+name = "issue-analyzer"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "ssh209", email = "moonfog@incross.com"}
+]
+readme = "README.md"
+
+# 1. 파이썬 버전을 현실적인 3.12 환경으로 고정합니다.
+requires-python = ">=3.12,<3.13" 
+
+dependencies = [
+    # --- LLM 및 Agent 프레임워크 ---
+    "google-genai",
+    "google-cloud-storage",
+    "google-cloud-aiplatform",
+    "langchain-core",
+    
+    # 2. numpy 2.x 미만과 호환되는 langchain-community 버전을 강제 타협시킵니다.
+    "langchain-community<0.3.0", 
+    "langchain-huggingface",
+    "langgraph",
+
+    # --- 머신러닝 및 데이터 처리 ---
+    "lightgbm",
+    "scikit-learn",
+    "pandas",
+    "numpy",
+    "joblib",
+    "statsmodels",
+
+    # --- 시계열 예측 모델 (TFT & MOIRAI) ---
+    "torch",
+    "pytorch-lightning",
+    "pytorch-forecasting",
+    "einops",
+    "gluonts",
+    "uni2ts",
+
+    # --- RAG (벡터 DB 및 임베딩) ---
+    "chromadb",
+    "sentence-transformers",
+
+    # --- UI 및 시각화 ---
+    "streamlit",
+    "graphviz",
+
+    # --- 데이터베이스 및 유효성 검사 ---
+    "asyncpg",
+    "pydantic"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-mock"
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

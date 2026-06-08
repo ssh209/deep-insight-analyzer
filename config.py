@@ -14,6 +14,30 @@ GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 
 # ==========================================
+# 🤖 에이전트별 LLM 모델 (멀티모델 전략)
+#
+# Flash: 고속·저비용 — 단순 분류, 지시서, 정량 비교
+# Pro:   고추론·고품질 — 전략 수립, 리포트 융합, 뉘앙스 판별
+# ==========================================
+FLASH_MODEL = os.environ.get("FLASH_MODEL", "gemini-2.5-flash")
+PRO_MODEL = os.environ.get("PRO_MODEL", "gemini-2.5-pro")
+
+# QueryBuilder: grounding(Pro) + JSON 추출(Flash) 2-step
+QUERY_BUILDER_GROUNDING_MODEL = os.environ.get("QUERY_BUILDER_GROUNDING_MODEL", PRO_MODEL)
+QUERY_BUILDER_MODEL = os.environ.get("QUERY_BUILDER_MODEL", FLASH_MODEL)
+
+# Analyzer: 감성 배치(Flash) + 테마/KOL 심층(Pro)
+ANALYZER_MODEL = os.environ.get("ANALYZER_MODEL", FLASH_MODEL)
+ANALYZER_DEEP_MODEL = os.environ.get("ANALYZER_DEEP_MODEL", PRO_MODEL)
+
+# Reporter 파이프라인
+PLANNER_MODEL = os.environ.get("PLANNER_MODEL", FLASH_MODEL)
+STRATEGIST_MODEL = os.environ.get("STRATEGIST_MODEL", PRO_MODEL)
+ANALYST_MODEL = os.environ.get("ANALYST_MODEL", FLASH_MODEL)
+COMPILER_MODEL = os.environ.get("COMPILER_MODEL", PRO_MODEL)
+REVIEWER_MODEL = os.environ.get("REVIEWER_MODEL", PRO_MODEL)
+
+# ==========================================
 # 📊 데이터 경로
 # ==========================================
 TRAIN_CSV_PATH = os.environ.get("TRAIN_CSV_PATH", "data/pr_crisis_dataset.csv")

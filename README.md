@@ -208,7 +208,8 @@ Issue_Cracker/
 │   ├── train_model.py              # LightGBM 사전 학습 & pkl 저장
 │   └── make_graph.py               # ForecasterAgent 단독 실행 차트 (Streamlit)
 │
-├── requirements.txt
+├── pyproject.toml                  # Poetry 의존성 및 프로젝트 설정
+├── poetry.lock                     # 의존성 잠금 파일 (재현 가능 빌드)
 ├── CLAUDE.md
 └── .gitignore
 ```
@@ -237,49 +238,69 @@ Issue_Cracker/
 
 ### 사전 요구사항
 
-- **Python** 3.10+
+- **Python** 3.12
 - **Google Cloud** 프로젝트 및 Vertex AI API 활성화
 - **Graphviz** 시스템 설치 ([다운로드](https://graphviz.org/download/))
 
-### 1. 프로젝트 클론 및 가상환경 설정
+### 0. Poetry 설치
+
+> Poetry가 이미 설치되어 있다면 이 단계를 건너뛰세요.
+
+**Windows (PowerShell)**
+
+```powershell
+(Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | python -
+```
+
+**macOS / Linux**
+
+```bash
+curl -sSL https://install.python-poetry.org | python3 -
+```
+
+설치 후 터미널을 재시작하고 버전을 확인합니다:
+
+```bash
+poetry --version   # Poetry (version 2.x.x)
+```
+
+> ⚠️ 설치 후 `poetry` 명령이 인식되지 않으면 [공식 문서](https://python-poetry.org/docs/#installation)를 참고하여 PATH를 설정하세요.
+
+### 1. 프로젝트 클론 및 의존성 설치
 
 ```bash
 git clone <repository-url>
 cd Issue_Cracker
 
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS/Linux
-source venv/bin/activate
+# 가상환경을 프로젝트 폴더 내(.venv/)에 생성하도록 설정
+poetry config virtualenvs.in-project true
+
+# 의존성 설치 (가상환경 자동 생성)
+poetry install
 ```
 
-### 2. 의존성 설치
+> 💡 개발 의존성(pytest 등)을 제외하려면 `poetry install --without dev`를 사용하세요.
 
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Google Cloud 인증 설정
+### 2. Google Cloud 인증 설정
 
 ```bash
 gcloud auth application-default login
 ```
 
-> ⚠️ `engine.py`의 `project` 파라미터를 본인의 GCP 프로젝트 ID로 변경하세요.
+> ⚠️ `config.py`의 `GCP_PROJECT_ID` 환경변수를 본인의 GCP 프로젝트 ID로 설정하세요.
 
-### 4-A. 대시보드 실행 (Streamlit UI)
+### 3-A. 대시보드 실행 (Streamlit UI)
 
 ```bash
-streamlit run app.py
+poetry run streamlit run app.py
 ```
 
 브라우저에서 `http://localhost:8501`로 접속합니다.
 
-### 4-B. CLI 모드 실행 (터미널)
+### 3-B. CLI 모드 실행 (터미널)
 
 ```bash
-python main.py
+poetry run python main.py
 ```
 
 ---
@@ -348,13 +369,13 @@ AnalyzerAgent가 `analysis_results`에 감성 분석 결과를 삽입하면, `ho
 psql -f sql/001_create_tables.sql
 
 # 2. 시드 데이터 삽입 (crises + posts + comments)
-python manual/seed_db.py --dsn postgresql://user:pass@localhost:5432/db
+poetry run python manual/seed_db.py --dsn postgresql://user:pass@localhost:5432/db
 
 # 3. 합성 학습/입력 데이터 생성
-python manual/make_dataset.py
+poetry run python manual/make_dataset.py
 
 # 4. LightGBM 모델 사전 학습
-python scripts/train_model.py
+poetry run python scripts/train_model.py
 ```
 
 ---

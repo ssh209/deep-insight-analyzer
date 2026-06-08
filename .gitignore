@@ -4,3 +4,4 @@ requirements-lock.txt
 .env
 *.pem
 deploy/*.json
+poetry.lock

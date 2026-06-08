@@ -8,7 +8,14 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
 # 중앙 설정 모듈
-from config import GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL, EMBEDDING_MODEL
+from config import (
+    GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL, EMBEDDING_MODEL,
+    # 에이전트별 모델 (멀티모델 전략)
+    QUERY_BUILDER_GROUNDING_MODEL, QUERY_BUILDER_MODEL,
+    ANALYZER_MODEL, ANALYZER_DEEP_MODEL,
+    PLANNER_MODEL, STRATEGIST_MODEL, ANALYST_MODEL,
+    COMPILER_MODEL, REVIEWER_MODEL,
+)
 from db import create_db_pool, close_db_pool, check_schema
 
 logger = logging.getLogger(__name__)
@@ -24,8 +31,6 @@ from agents.reporter.analyst import AnalystAgent
 from agents.reporter.strategist import StrategistAgent
 from agents.reporter.compiler import CompilerAgent
 from agents.reviewer import ReviewerAgent
-
-MODEL_NAME = GEMINI_MODEL
 
 # 인프라 컴포넌트 초기화 함수
 async def init_infrastructure():
@@ -78,18 +83,32 @@ async def init_infrastructure():
 # Forecaster는 state["forecaster_model"]에 따라 런타임에 모델 자동 선택.
 # ==========================================
 def build_graph(client, vector_db, embeddings=None, db_pool=None):
-    # 1. 에이전트 인스턴스 초기화
-    query_builder = QueryBuilderAgent(client, MODEL_NAME, embeddings) if db_pool and embeddings else None
+    # 1. 에이전트 인스턴스 초기화 (멀티모델 전략: Flash/Pro 분리)
+    query_builder = QueryBuilderAgent(
+        client, QUERY_BUILDER_MODEL, embeddings,
+        grounding_model_name=QUERY_BUILDER_GROUNDING_MODEL,
+    ) if db_pool and embeddings else None
     retriever = RetrieverAgent(db_pool) if db_pool else None
-    analyzer = AnalyzerAgent(client, MODEL_NAME, db_pool) if db_pool else None
+    analyzer = AnalyzerAgent(
+        client, ANALYZER_MODEL, db_pool,
+        deep_model_name=ANALYZER_DEEP_MODEL,
+    ) if db_pool else None
     # ForecasterAgent는 루트 컨트롤러 — state["forecaster_model"]로 런타임 라우팅
     baseline_forecaster = ForecasterAgent(mode="baseline")
     mitigated_forecaster = ForecasterAgent(mode="mitigated")
-    analyst = AnalystAgent(client, MODEL_NAME)
-    planner = PlannerAgent(client, MODEL_NAME)
-    strategist = StrategistAgent(client, MODEL_NAME, vector_db)
-    compiler = CompilerAgent(client, MODEL_NAME)
-    reviewer = ReviewerAgent(client, MODEL_NAME, vector_db)
+    analyst = AnalystAgent(client, ANALYST_MODEL)
+    planner = PlannerAgent(client, PLANNER_MODEL)
+    strategist = StrategistAgent(client, STRATEGIST_MODEL, vector_db)
+    compiler = CompilerAgent(client, COMPILER_MODEL)
+    reviewer = ReviewerAgent(client, REVIEWER_MODEL, vector_db)
+
+    logger.info(
+        f"🤖 멀티모델 전략 적용 — "
+        f"QueryBuilder: {QUERY_BUILDER_MODEL} (grounding: {QUERY_BUILDER_GROUNDING_MODEL}), "
+        f"Analyzer: {ANALYZER_MODEL} (deep: {ANALYZER_DEEP_MODEL}), "
+        f"Planner: {PLANNER_MODEL}, Strategist: {STRATEGIST_MODEL}, "
+        f"Analyst: {ANALYST_MODEL}, Compiler: {COMPILER_MODEL}, Reviewer: {REVIEWER_MODEL}"
+    )
 
     workflow = StateGraph(PipelineState)
 
