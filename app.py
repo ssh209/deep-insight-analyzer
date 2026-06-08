@@ -1,22 +1,24 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import json
+import asyncio
 import pandas as pd
 import time
 import numpy as np
 import graphviz
 from engine import init_infrastructure, build_graph
+from db import close_db_pool
 
 # ==========================================
 # ⚙️ 백엔드 엔진 로드 및 캐싱
 # ==========================================
 @st.cache_resource
 def setup_backend():
-    client, vector_db, embeddings = init_infrastructure()
-    app_graph = build_graph(client, vector_db, embeddings)
-    return app_graph
+    client, vector_db, embeddings, db_pool = asyncio.run(init_infrastructure())
+    app_graph = build_graph(client, vector_db, embeddings, db_pool)
+    return app_graph, db_pool
 
-app_graph = setup_backend()
+app_graph, _db_pool = setup_backend()
 
 # ==========================================
 # 🔄 파이프라인 노드 정의 (공통 상수)
@@ -151,6 +153,13 @@ st.markdown("무대응(Do Nothing) vs 전략 적용(Mitigated) **이원화 시�
 # ==========================================
 with st.sidebar:
     st.header("📝 입력 파라미터")
+    
+    # DB 연결 상태 표시
+    if _db_pool is not None:
+        st.success("🟢 DB 연결됨 — DB 모드", icon="🗄️")
+    else:
+        st.warning("🟡 CSV 모드 — DATABASE_URL 미설정", icon="📄")
+    
     target_csv = st.text_input("입력 데이터 (72h 현재 위기)", value="data/input_crisis_72h.csv")
     
     # 🎯 SCCT 위기 유형 선택 (감쇠 파라미터 결정)

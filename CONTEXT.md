@@ -34,10 +34,11 @@ START → [Analyzer(선택)] → Baseline Forecaster → Planner → Strategist(
 
 ```
 Issue_Cracker/
-├── app.py                  # Streamlit 대시보드 (358줄)
+├── app.py                  # Streamlit 대시보드 (368줄)
 ├── engine.py               # LangGraph 워크플로우 빌더 (87줄)
 ├── state.py                # PipelineState(TypedDict) + Pydantic 스키마
-├── config.py               # ★ 환경변수 중앙 설정 (신규 생성)
+├── config.py               # ★ 환경변수 중앙 설정
+├── db.py                   # ★ asyncpg DB 커넥션 풀 관리 (신규)
 ├── main.py                 # CLI 테스트 엔트리포인트
 │
 ├── agents/
@@ -101,10 +102,25 @@ Issue_Cracker/
 - `.gitignore` — .env, *.pem, deploy/*.json 추가
 - `.env.example` — 환경변수 템플릿
 
+### 3-3. DB 연결 로직 구현 (완료)
+- `db.py` — asyncpg 커넥션 풀 관리 모듈 신규 생성
+  - `create_db_pool()` / `close_db_pool()` / `check_schema()`
+  - DATABASE_URL 미설정 시 None 반환 → CSV 모드 폴백
+  - SSL 지원 (Neon, Supabase 등 클라우드 DB 호환)
+  - 연결 실패 시 앱 크래시 방지 → 경고 로그 + CSV 모드 폴백
+  - 스키마 존재 여부 확인 (issue_cracker 스키마 누락 시 경고)
+- `config.py` — DB_MIN_CONNECTIONS, DB_MAX_CONNECTIONS, DB_SSL 설정 추가
+- `engine.py` — `init_infrastructure()` async 전환, DB 풀 생성·주입
+- `app.py` — 비동기 초기화 + 사이드바 DB 연결 상태 표시
+- `main.py` — 비동기 초기화 + DB 풀 정리
+- `setup-aws.sh` — Task Definition에 DATABASE_URL, DB_SSL 환경변수 추가
+- `.env.example` — Neon/Supabase/Aurora/로컬 예시 추가
+
 ### 결정된 사항
 - **AWS 리전**: `ap-northeast-2` (서울) 고정
 - **컨테이너 사양**: 1 vCPU + 4GB 메모리
-- **DB**: CSV 직접 입력 모드로 먼저 배포 (Aurora Serverless v2는 후속 작업)
+- **DB**: 외부 PostgreSQL 연결 (DATABASE_URL 환경변수) — 미설정 시 CSV 직접 입력 모드
+- **DB 프로비저닝**: 배포 스크립트에서 분리 (콘솔/Terraform/별도 스크립트로 수행)
 - **GCP 인증**: 서비스 계정 키를 Secrets Manager에 저장하는 방식 권장 (미구현, 수동 처리 필요)
 
 ---
@@ -121,9 +137,9 @@ Issue_Cracker/
 - [ ] RAG 벡터 DB에 실제 PR 사례/가이드라인 데이터 투입
 - [ ] 테스트 코드 작성 (ForecasterAgent SCCT 감쇠 로직 우선)
 - [ ] 에러 핸들링 강화 (LLM 호출 실패 시 Fallback)
+- [ ] 외부 PostgreSQL 프로비저닝 + DDL 실행 (sql/001_create_tables.sql)
 
 ### 중장기
-- [ ] Aurora Serverless v2 연동 (AnalyzerAgent DB 모드 활성화)
 - [ ] 도메인 + HTTPS (ACM + Route 53)
 - [ ] Fargate Spot 적용 (비용 최적화)
 - [ ] 모니터링/로깅 대시보드 (CloudWatch → Grafana)

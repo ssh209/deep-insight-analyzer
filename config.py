@@ -20,9 +20,12 @@ TRAIN_CSV_PATH = os.environ.get("TRAIN_CSV_PATH", "data/pr_crisis_dataset.csv")
 INPUT_CSV_PATH = os.environ.get("INPUT_CSV_PATH", "data/input_crisis_72h.csv")
 
 # ==========================================
-# 🗄️ Database (향후 Aurora Serverless 연동 시 사용)
+# 🗄️ Database (외부 PostgreSQL 연결)
 # ==========================================
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DB_MIN_CONNECTIONS = int(os.environ.get("DB_MIN_CONNECTIONS", "2"))
+DB_MAX_CONNECTIONS = int(os.environ.get("DB_MAX_CONNECTIONS", "10"))
+DB_SSL = os.environ.get("DB_SSL", "true").lower() in ("true", "1", "yes")
 
 # ==========================================
 # 🔤 Embedding Model

@@ -257,7 +257,9 @@ cat > /tmp/task-def.json <<TASKEOF
             "environment": [
                 { "name": "GCP_PROJECT_ID", "value": "${GCP_PROJECT_ID:-deep-insight-496705}" },
                 { "name": "GCP_LOCATION", "value": "${GCP_LOCATION:-global}" },
-                { "name": "GEMINI_MODEL", "value": "${GEMINI_MODEL:-gemini-2.5-pro}" }
+                { "name": "GEMINI_MODEL", "value": "${GEMINI_MODEL:-gemini-2.5-pro}" },
+                { "name": "DATABASE_URL", "value": "${DATABASE_URL:-}" },
+                { "name": "DB_SSL", "value": "${DB_SSL:-true}" }
             ],
             "logConfiguration": {
                 "logDriver": "awslogs",

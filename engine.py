@@ -1,4 +1,6 @@
 import json
+import asyncio
+import logging
 from google import genai
 from langgraph.graph import StateGraph, START, END
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -7,6 +9,9 @@ from langchain_core.documents import Document
 
 # 중앙 설정 모듈
 from config import GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL, EMBEDDING_MODEL
+from db import create_db_pool, close_db_pool, check_schema
+
+logger = logging.getLogger(__name__)
 
 # 모듈화된 에이전트 파트 파이프라인 임포트
 from state import PipelineState
@@ -23,7 +28,13 @@ from agents.reviewer import ReviewerAgent
 MODEL_NAME = GEMINI_MODEL
 
 # 인프라 컴포넌트 초기화 함수
-def init_infrastructure():
+async def init_infrastructure():
+    """LLM 클라이언트, 벡터 DB, 임베딩 모델, DB 풀을 초기화합니다.
+
+    Returns:
+        tuple: (client, vector_db, embeddings, db_pool)
+            - db_pool: asyncpg.Pool 또는 None (CSV 모드)
+    """
     client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location=GCP_LOCATION)
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
@@ -35,7 +46,23 @@ def init_infrastructure():
         Document(page_content="[금칙어] 절대 '오해', '유감'이라는 단어를 쓰지 말 것. 책임을 전가하는 뉘앙스 금지.", metadata={"type": "guideline"})
     ]
     vector_db = Chroma.from_documents(dummy_docs, embeddings)
-    return client, vector_db, embeddings
+
+    # DB 풀 생성 (DATABASE_URL이 비어있으면 None → CSV 모드)
+    db_pool = await create_db_pool()
+    if db_pool:
+        schema_ok = await check_schema(db_pool)
+        if not schema_ok:
+            logger.warning(
+                "⚠️ DB 스키마가 준비되지 않았습니다. "
+                "sql/001_create_tables.sql 실행 후 재시작하세요. "
+                "현재는 CSV 모드로 동작합니다."
+            )
+            await close_db_pool(db_pool)
+            db_pool = None
+
+    mode = "DB 모드" if db_pool else "CSV 모드"
+    logger.info(f"🚀 인프라 초기화 완료 — {mode}")
+    return client, vector_db, embeddings, db_pool
 
 # ==========================================
 # 🔄 순차 파이프라인 워크플로우 빌더
@@ -116,6 +143,9 @@ def build_graph(client, vector_db, embeddings=None, db_pool=None):
     return workflow.compile()
 
 if __name__ == "__main__":
-    client, vector_db, embeddings = init_infrastructure()
-    app = build_graph(client, vector_db, embeddings)
-    print(app.get_graph().print_ascii())
+    async def _main():
+        client, vector_db, embeddings, db_pool = await init_infrastructure()
+        app = build_graph(client, vector_db, embeddings, db_pool)
+        print(app.get_graph().print_ascii())
+        await close_db_pool(db_pool)
+    asyncio.run(_main())
