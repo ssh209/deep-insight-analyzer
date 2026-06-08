@@ -1,12 +1,15 @@
 """
-AnalyzerAgent — 원본 텍스트(Posts/Comments) → 시계열 피처 변환
+AnalyzerAgent — 원본 텍스트(Posts/Comments) → 감성 분류 → 시계열 피처 변환
 
-파이프라인 최전방에서:
-1. DB에서 미분석 댓글 로드 (asyncpg)
+설계 원칙: DB SELECT 없음. Retriever가 state에 담은 메모리 데이터만 소비.
+
+파이프라인 흐름:
+1. state["retrieved_comments"]에서 댓글 로드 (메모리)
 2. LLM 배치 감성 분류 (Online API: asyncio.gather, 50건×5 병렬)
 3. 3회 재시도 → 최종 실패분은 sentiment=NULL 유지 (언급량에만 포함)
-4. Posts 영향력 스코어링 (규칙 기반)
-5. Materialized View 리프레시 → CSV 내보내기 → ForecasterAgent 입력
+4. Posts 영향력 스코어링 (규칙 기반, 메모리)
+5. 분석 결과 집계 → CSV 내보내기 → ForecasterAgent 입력
+6. 여론 지형도 / 감성 타임라인 / KOL 식별 (메모리 + LLM)
 
 이원화 전략:
   - 초기 대량 분석 (수만건): Vertex AI Batch Prediction (50% 할인, 비동기)
@@ -39,6 +42,31 @@ class BatchAnalysisResult(BaseModel):
     results: list[CommentAnalysis]
 
 
+class ThemeCluster(BaseModel):
+    theme: str = Field(description="주제명 (한글, 10자 이내)")
+    estimated_ratio: float = Field(description="해당 주제의 추정 비율 (0~1)")
+    representative_comment: str = Field(description="대표 댓글 원문 (원본 그대로)")
+    intensity: Literal["high", "medium", "low"] = Field(
+        description="해당 주제의 여론 강도"
+    )
+
+class ThemeClusterList(BaseModel):
+    clusters: list[ThemeCluster]
+
+
+class KOLStanceAnalysis(BaseModel):
+    index: int = Field(description="작성자 번호 (1부터 시작)")
+    stance: Literal["hostile", "neutral", "supportive"] = Field(
+        description="기업/이슈에 대한 성향"
+    )
+    risk_assessment: str = Field(
+        description="해당 작성자의 향후 행동 예측 및 대응 권고 (1~2문장)"
+    )
+
+class KOLStanceList(BaseModel):
+    results: list[KOLStanceAnalysis]
+
+
 # ==========================================
 # 📋 감성 분류 시스템 프롬프트
 # ==========================================
@@ -66,7 +94,7 @@ class AnalyzerAgent:
     """
     원본 댓글 → 감성 분류 → 시계열 피처 변환 에이전트.
     
-    asyncpg 풀을 주입받아 DB와 비동기 통신합니다.
+    DB 의존성 없음. Retriever가 state에 담은 메모리 데이터만 소비.
     LangGraph 노드로 사용 시 run()이 async로 호출됩니다.
     """
     
@@ -74,52 +102,62 @@ class AnalyzerAgent:
     CONCURRENT = 5          # 동시 배치 수
     MAX_RETRIES = 3         # 최대 재시도 횟수
     
-    def __init__(self, client, model_name: str, db_pool):
+    def __init__(self, client, model_name: str, db_pool=None):
         self.client = client
         self.model_name = model_name
-        self.pool = db_pool     # asyncpg.Pool
+        self.pool = db_pool     # asyncpg.Pool (INSERT 전용, SELECT는 Retriever에서)
     
     # ==========================================
     # 🚀 메인 실행 (LangGraph 노드)
     # ==========================================
     async def run(self, state: dict) -> dict:
-        issue_id = state["issue_id"]
-        post_ids = state.get("retrieved_post_ids", [])
-        print(f"\n>> [Analyzer] issue_id={issue_id} 분석 시작 (posts {len(post_ids)}건)...")
+        issue_id = state.get("issue_id", "unknown")
+        posts = state.get("retrieved_posts", [])
+        comments = state.get("retrieved_comments", [])
         
-        # 0. issues 상태 업데이트
-        await self._update_issue_status(issue_id, 'analyzing')
+        print(f"\n>> [Analyzer] issue_id={issue_id} 분석 시작 "
+              f"(posts {len(posts)}건, comments {len(comments)}건)...")
         
-        # 1. 미분석 댓글 로드 (Retriever가 확보한 posts 기준)
-        comments = await self._load_unanalyzed(issue_id, post_ids)
-        
+        # 1. LLM 배치 감성 분류 + 3회 재시도
         if not comments:
-            print("   [SKIP] 미분석 댓글 없음 (이미 분석 완료)")
+            print("   [SKIP] 분석 대상 댓글 없음")
+            analysis_results = []
         else:
-            print(f"   [LOAD] 미분석 댓글 {len(comments)}건 로드")
-            
-            # 2. 배치 감성 분류 + 3회 재시도
-            success, failed = await self._analyze_with_retry(comments, issue_id)
-            print(f"   [DONE] 분석 성공 {success}건, 최종 실패 {failed}건")
+            analysis_results, failed = await self._analyze_with_retry(comments)
+            print(f"   [DONE] 분석 성공 {len(analysis_results)}건, 최종 실패 {failed}건")
         
-        # 3. Posts 영향력 스코어링
-        scored = await self._score_posts(issue_id, post_ids)
-        print(f"   [SCORE] Posts 영향력 스코어링: {scored}건")
+        # 2. 분석 결과 DB 저장 (analysis_results INSERT)
+        if analysis_results and self.pool:
+            saved = await self._save_analysis_results(analysis_results, issue_id)
+            print(f"   [DB] 감성 분석 결과 {saved}건 INSERT")
         
-        # 4. 집계 → CSV 내보내기
-        csv_path = await self._export_csv(issue_id)
+        # 3. Posts 영향력 스코어링 (규칙 기반, 메모리)
+        post_scores = self._score_posts(posts)
+        print(f"   [SCORE] Posts 영향력 스코어링: {len(post_scores)}건")
+        
+        # 4. Post 스코어 DB 저장
+        if post_scores and self.pool:
+            saved = await self._save_post_scores(post_scores, issue_id)
+            print(f"   [DB] Post 영향력 스코어 {saved}건 INSERT")
+        
+        # 5. 집계 → CSV 내보내기
+        csv_path = self._export_csv(comments, analysis_results, post_scores, issue_id)
         print(f"   [EXPORT] CSV: {csv_path}")
         
-        # 5. 여론 지형도 (Sentiment Landscape) 생성
-        landscape = await self._build_sentiment_landscape(issue_id, post_ids)
+        # 6. 여론 지형도 (Sentiment Landscape) 생성
+        landscape = await self._build_sentiment_landscape(
+            comments, analysis_results
+        )
         print(f"   [LANDSCAPE] 여론 지형도 생성 완료")
         
-        # 6. 감성 타임라인 (Sentiment Timeline) 생성
-        timeline = await self._build_sentiment_timeline(issue_id)
+        # 7. 감성 타임라인 (Sentiment Timeline) 생성
+        timeline = self._build_sentiment_timeline(
+            comments, analysis_results, posts, post_scores
+        )
         print(f"   [TIMELINE] 감성 타임라인 생성 완료")
         
-        # 7. KOL (Key Opinion Leader) 식별
-        kols = await self._identify_kols(issue_id, post_ids)
+        # 8. KOL (Key Opinion Leader) 식별
+        kols = await self._identify_kols(posts, post_scores)
         print(f"   [KOL] {len(kols)}명 식별 완료")
         
         return {
@@ -130,50 +168,18 @@ class AnalyzerAgent:
         }
     
     # ==========================================
-    # Step 0. issues 상태 관리
+    # Step 1. LLM 배치 감성 분류 + 재시도
     # ==========================================
-    async def _update_issue_status(self, issue_id: str, status: str):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE issue_cracker.issues
-                SET status = $2, updated_at = NOW()
-                WHERE issue_id = $1
-            """, issue_id, status)
-    
-    # ==========================================
-    # Step 1. 미분석 댓글 로드
-    # analysis_results에 아직 없는 댓글만 조회
-    # ==========================================
-    async def _load_unanalyzed(self, issue_id: str, post_ids: list[str]) -> list[dict]:
-        """Retriever가 확보한 posts의 댓글 중, 이 issue에서 미분석인 것만 로드."""
-        if not post_ids:
-            return []
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT c.comment_id, c.body, c.like_count, c.reply_count
-                FROM issue_cracker.comments c
-                LEFT JOIN issue_cracker.analysis_results ar
-                    ON ar.target_type = 'comment'
-                    AND ar.target_id = c.comment_id
-                    AND ar.issue_id = $1
-                    AND ar.model_version = $3
-                WHERE c.post_id = ANY($2)
-                  AND ar.id IS NULL
-                ORDER BY c.created_at
-            """, issue_id, post_ids, self.model_name)
-        return [dict(r) for r in rows]
-    
-    # ==========================================
-    # Step 2. LLM 배치 감성 분류 + 재시도
-    # ==========================================
-    async def _analyze_with_retry(self, comments: list[dict], issue_id: str) -> tuple[int, int]:
-        """3회 재시도 로직. 최종 실패분은 analysis_results에 미등록 → 언급량에만 포함."""
+    async def _analyze_with_retry(
+        self, comments: list[dict]
+    ) -> tuple[list[dict], int]:
+        """3회 재시도 로직. 반환: (분석 결과 리스트, 실패 건수)."""
         batches = [
             comments[i:i + self.BATCH_SIZE] 
             for i in range(0, len(comments), self.BATCH_SIZE)
         ]
         
-        total_success = 0
+        all_results = []
         pending = batches
         
         for attempt in range(1, self.MAX_RETRIES + 1):
@@ -184,7 +190,7 @@ class AnalyzerAgent:
             
             for chunk_start in range(0, len(pending), self.CONCURRENT):
                 chunk = pending[chunk_start:chunk_start + self.CONCURRENT]
-                tasks = [self._call_llm_and_save(batch, issue_id) for batch in chunk]
+                tasks = [self._call_llm(batch) for batch in chunk]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 for i, result in enumerate(results):
@@ -193,18 +199,19 @@ class AnalyzerAgent:
                               f"배치 {len(chunk[i])}건 실패: {result}")
                         failed_batches.append(chunk[i])
                     else:
-                        total_success += result
+                        all_results.extend(result)
             
             pending = failed_batches
             
+            # exponential back-off
             if pending and attempt < self.MAX_RETRIES:
                 await asyncio.sleep(2 ** attempt)
         
         total_failed = sum(len(b) for b in pending)
-        return total_success, total_failed
+        return all_results, total_failed
     
-    async def _call_llm_and_save(self, batch: list[dict], issue_id: str) -> int:
-        """1개 배치(최대 50건) LLM 호출 → analysis_results INSERT. 성공 건수 반환."""
+    async def _call_llm(self, batch: list[dict]) -> list[dict]:
+        """1개 배치(최대 50건) LLM 호출. 분석 결과 리스트 반환."""
         comments_text = "\n".join(
             f"[{c['comment_id']}] {c['body'][:200]}" for c in batch
         )
@@ -223,9 +230,19 @@ class AnalyzerAgent:
         )
         
         result = json.loads(response.text)
-        analyses = result["results"]
-        
-        # analysis_results에 INSERT
+        return result["results"]
+    
+    # ==========================================
+    # Step 1b. 분석 결과 DB 저장 (INSERT only)
+    # ==========================================
+    async def _save_analysis_results(self, analysis_results: list[dict], issue_id: str) -> int:
+        """LLM 감성 분석 결과를 analysis_results 테이블에 INSERT."""
+        rows = [
+            (issue_id, a["comment_id"], a["sentiment"],
+             a["sentiment_score"], a["is_mockery"], a["is_advocate"],
+             self.model_name)
+            for a in analysis_results
+        ]
         async with self.pool.acquire() as conn:
             await conn.executemany("""
                 INSERT INTO issue_cracker.analysis_results
@@ -233,147 +250,170 @@ class AnalyzerAgent:
                      sentiment, sentiment_score, is_mockery, is_advocate,
                      model_version)
                 VALUES ($1, 'comment', $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (target_type, target_id, model_version) DO NOTHING
-            """, [
-                (issue_id, a["comment_id"], a["sentiment"],
-                 a["sentiment_score"], a["is_mockery"], a["is_advocate"],
-                 self.model_name)
-                for a in analyses
-            ])
-        
-        return len(analyses)
+                ON CONFLICT (issue_id, target_type, target_id, model_version) DO NOTHING
+            """, rows)
+        return len(rows)
     
     # ==========================================
-    # Step 3. Posts 영향력 스코어링 (규칙 기반)
-    # → analysis_results에 INSERT
+    # Step 2. Posts 영향력 스코어링 (규칙 기반, 메모리)
     # ==========================================
-    async def _score_posts(self, issue_id: str, post_ids: list[str]) -> int:
-        """Retriever가 확보한 posts의 영향력 스코어링."""
-        if not post_ids:
-            return 0
+    def _score_posts(self, posts: list[dict]) -> dict[str, int]:
+        """posts 리스트 → {post_id: influence_score} 매핑.
+        
+        influence_score:
+          2 = 메가 인플루언서 (followers >= 100K or views >= 500K)
+          1 = 인플루언서 (followers >= 10K or views >= 50K)
+          0 = 일반
+        """
+        scores = {}
+        for p in posts:
+            followers = p.get("author_followers", 0) or 0
+            views = p.get("view_count", 0) or 0
+            if followers >= 100000 or views >= 500000:
+                scores[p["post_id"]] = 2
+            elif followers >= 10000 or views >= 50000:
+                scores[p["post_id"]] = 1
+            else:
+                scores[p["post_id"]] = 0
+        return scores
+
+    # ==========================================
+    # Step 2b. Post 영향력 스코어 DB 저장 (INSERT only)
+    # ==========================================
+    async def _save_post_scores(self, post_scores: dict[str, int], issue_id: str) -> int:
+        """규칙 기반 영향력 스코어를 analysis_results 테이블에 INSERT."""
+        rows = [
+            (issue_id, post_id, score, 'rule-based')
+            for post_id, score in post_scores.items()
+        ]
         async with self.pool.acquire() as conn:
-            result = await conn.execute("""
+            await conn.executemany("""
                 INSERT INTO issue_cracker.analysis_results
                     (issue_id, target_type, target_id, influence_score, model_version)
-                SELECT
-                    $1,
-                    'post',
-                    p.post_id,
-                    CASE
-                        WHEN p.author_followers >= 100000 OR p.view_count >= 500000 THEN 2
-                        WHEN p.author_followers >= 10000  OR p.view_count >= 50000  THEN 1
-                        ELSE 0
-                    END,
-                    'rule-based'
-                FROM issue_cracker.posts p
-                LEFT JOIN issue_cracker.analysis_results ar
-                    ON ar.target_type = 'post'
-                    AND ar.target_id = p.post_id
-                    AND ar.issue_id = $1
-                    AND ar.model_version = 'rule-based'
-                WHERE p.post_id = ANY($2)
-                  AND ar.id IS NULL
+                VALUES ($1, 'post', $2, $3, $4)
                 ON CONFLICT (issue_id, target_type, target_id, model_version) DO NOTHING
-            """, issue_id, post_ids)
-        return int(result.split()[-1]) if result else 0
+            """, rows)
+        return len(rows)
     
     # ==========================================
-    # Step 4. MV 리프레시 + CSV 내보내기
+    # Step 3. 분석 결과 집계 → CSV 내보내기
     # ==========================================
-    async def _export_csv(self, issue_id: str) -> str:
-        """analysis_results에서 직접 시간당 집계 → CSV 내보내기."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT
-                    date_trunc('hour', c.created_at) AS hour_bucket,
-                    COUNT(*)                                              AS total_mentions,
-                    COUNT(ar.id)                                          AS analyzed_count,
-                    COUNT(*) FILTER (WHERE ar.sentiment = 'negative')     AS negative_mentions,
-                    COUNT(*) FILTER (WHERE ar.is_mockery = TRUE)          AS mockery_mentions,
-                    COUNT(*) FILTER (WHERE ar.is_advocate = TRUE)         AS advocate_mentions,
-                    ROUND(
-                        COUNT(*) FILTER (WHERE ar.sentiment = 'negative')::NUMERIC
-                        / NULLIF(COUNT(ar.id), 0), 3
-                    ) AS negative_ratio,
-                    ROUND(
-                        COUNT(*) FILTER (WHERE ar.is_mockery = TRUE)::NUMERIC
-                        / NULLIF(COUNT(ar.id), 0), 3
-                    ) AS mockery_index,
-                    ROUND(
-                        COUNT(*) FILTER (WHERE ar.is_advocate = TRUE)::NUMERIC
-                        / NULLIF(COUNT(ar.id), 0), 3
-                    ) AS advocate_ratio,
-                    COALESCE(
-                        MAX(par.influence_score) FILTER (WHERE par.influence_score IS NOT NULL), 0
-                    ) AS influencer_impact
-                FROM issue_cracker.comments c
-                LEFT JOIN issue_cracker.analysis_results ar
-                    ON ar.target_type = 'comment'
-                    AND ar.target_id = c.comment_id
-                    AND ar.issue_id = $1
-                JOIN issue_cracker.posts p ON c.post_id = p.post_id
-                LEFT JOIN issue_cracker.analysis_results par
-                    ON par.target_type = 'post'
-                    AND par.target_id = p.post_id
-                    AND par.issue_id = $1
-                WHERE c.post_id IN (
-                    SELECT DISTINCT target_id FROM issue_cracker.analysis_results
-                    WHERE issue_id = $1 AND target_type = 'post'
-                    UNION
-                    SELECT DISTINCT post_id FROM issue_cracker.comments
-                    WHERE comment_id IN (
-                        SELECT target_id FROM issue_cracker.analysis_results
-                        WHERE issue_id = $1 AND target_type = 'comment'
-                    )
-                )
-                GROUP BY date_trunc('hour', c.created_at)
-                ORDER BY hour_bucket
-            """, issue_id)
+    def _export_csv(
+        self,
+        comments: list[dict],
+        analysis_results: list[dict],
+        post_scores: dict[str, int],
+        issue_id: str,
+    ) -> str:
+        """메모리 데이터로 시간당 집계 → ForecasterAgent 입력 CSV 생성."""
+        # 댓글 데이터가 없으면 빈 csv 파일 생성
+        if not comments:
+            os.makedirs("data", exist_ok=True)
+            csv_path = f"data/analyzed_{issue_id}.csv"
+            pd.DataFrame(columns=[
+                "Datetime", "Hours_Since_Start", "Company_Action_Type",
+                "Influencer_Impact", "Raw_Total_Mentions",
+                "Negative_Ratio", "Mockery_Index", "Advocate_Ratio",
+                "Negative_Momentum", "Actual_NVI"
+            ]).to_csv(csv_path, index=False)
+            return csv_path
         
-        df = pd.DataFrame([dict(r) for r in rows])
+        # 분석 결과를 comment_id로 인덱싱
+        analysis_map = {}
+        for a in analysis_results:
+            analysis_map[a["comment_id"]] = a
         
-        # Feature Engineering: ForecasterAgent 입력 형태로 변환
-        df = self._engineer_features(df)
+        # 댓글 DataFrame 생성
+        df = pd.DataFrame(comments)
+        df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+        df["hour_bucket"] = df["created_at"].dt.floor("h")
         
-        os.makedirs("data", exist_ok=True)
-        csv_path = f"data/analyzed_{issue_id}.csv"
-        df.to_csv(csv_path, index=False)
-        return csv_path
-    
-    def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """시간당 집계 데이터 → ForecasterAgent 입력 CSV 형태로 변환."""
-        if df.empty:
-            return df
+        # 분석 결과 병합
+        df["sentiment"] = df["comment_id"].map(
+            lambda cid: analysis_map.get(cid, {}).get("sentiment")
+        )
+        df["is_mockery"] = df["comment_id"].map(
+            lambda cid: analysis_map.get(cid, {}).get("is_mockery", False)
+        )
+        df["is_advocate"] = df["comment_id"].map(
+            lambda cid: analysis_map.get(cid, {}).get("is_advocate", False)
+        )
         
-        # 시간 기반 피처
-        df["Datetime"] = pd.to_datetime(df["hour_bucket"])
-        start = df["Datetime"].min()
-        df["Hours_Since_Start"] = (df["Datetime"] - start).dt.total_seconds() / 3600
+        # 인플루언서 임팩트 (해당 시간에 메가 인플루언서 post가 있는지)
+        influencer_hours = set()
+        for p_id, score in post_scores.items():
+            if score >= 1:
+                # 해당 post의 댓글이 속한 시간대
+                post_comments = df[df["post_id"] == p_id]
+                if not post_comments.empty:
+                    influencer_hours.update(post_comments["hour_bucket"].unique())
         
-        # 컬럼명 매핑 (ForecasterAgent 기대 형식)
-        df["Raw_Total_Mentions"] = df["total_mentions"].astype(float)
-        df["Negative_Ratio"] = df["negative_ratio"].astype(float).fillna(0)
-        df["Mockery_Index"] = df["mockery_index"].astype(float).fillna(0)
-        df["Advocate_Ratio"] = df["advocate_ratio"].astype(float).fillna(0)
-        df["Influencer_Impact"] = df["influencer_impact"].astype(int)
+        # 시간별 감성 분석 결과 취합
+        analyzed = df[df["sentiment"].notna()]
         
-        # Negative_Momentum: 부정 건수 시간당 변화량
-        df["Negative_Momentum"] = df["negative_mentions"].astype(float).diff().fillna(0)
+        hourly_total = df.groupby("hour_bucket").agg(
+            total_mentions=("comment_id", "count"),
+        ).reset_index()
         
-        # Company_Action_Type: 분석 단계에서는 0 (무대응 기본)
-        df["Company_Action_Type"] = 0
+        if not analyzed.empty:
+            hourly_analyzed = analyzed.groupby("hour_bucket").agg(
+                analyzed_count=("comment_id", "count"),
+                negative_count=("sentiment", lambda x: (x == "negative").sum()),
+                mockery_count=("is_mockery", "sum"),
+                advocate_count=("is_advocate", "sum"),
+            ).reset_index()
+        else:
+            hourly_analyzed = pd.DataFrame(columns=[
+                "hour_bucket", "analyzed_count", "negative_count",
+                "mockery_count", "advocate_count"
+            ])
         
-        # NVI 산출 (Analyzer 단계의 실측 NVI)
-        df["Actual_NVI"] = self._compute_nvi(df)
+        hourly = hourly_total.merge(hourly_analyzed, on="hour_bucket", how="left")
+        hourly = hourly.fillna(0)
+        hourly = hourly.sort_values("hour_bucket").reset_index(drop=True)
         
-        # 필요 컬럼만 선별
+        # Feature Engineering
+        hourly["Datetime"] = hourly["hour_bucket"]
+        start = hourly["Datetime"].min()
+        hourly["Hours_Since_Start"] = (
+            (hourly["Datetime"] - start).dt.total_seconds() / 3600
+        )
+        
+        hourly["Raw_Total_Mentions"] = hourly["total_mentions"].astype(float)
+        
+        analyzed_cnt = hourly["analyzed_count"].astype(float).replace(0, np.nan)
+        hourly["Negative_Ratio"] = (
+            hourly["negative_count"].astype(float) / analyzed_cnt
+        ).fillna(0).round(3)
+        hourly["Mockery_Index"] = (
+            hourly["mockery_count"].astype(float) / analyzed_cnt
+        ).fillna(0).round(3)
+        hourly["Advocate_Ratio"] = (
+            hourly["advocate_count"].astype(float) / analyzed_cnt
+        ).fillna(0).round(3)
+        
+        hourly["Negative_Momentum"] = (
+            hourly["negative_count"].astype(float).diff().fillna(0)
+        )
+        
+        hourly["Influencer_Impact"] = hourly["hour_bucket"].apply(
+            lambda h: 1 if h in influencer_hours else 0
+        )
+        
+        hourly["Company_Action_Type"] = 0
+        hourly["Actual_NVI"] = self._compute_nvi(hourly)
+        
         output_cols = [
             "Datetime", "Hours_Since_Start", "Company_Action_Type",
             "Influencer_Impact", "Raw_Total_Mentions",
             "Negative_Ratio", "Mockery_Index", "Advocate_Ratio",
             "Negative_Momentum", "Actual_NVI"
         ]
-        return df[output_cols]
+        
+        os.makedirs("data", exist_ok=True)
+        csv_path = f"data/analyzed_{issue_id}.csv"
+        hourly[output_cols].to_csv(csv_path, index=False)
+        return csv_path
     
     def _compute_nvi(self, df: pd.DataFrame) -> pd.Series:
         """감성 지표 기반 NVI(Net Valence Index) 산출."""
@@ -397,9 +437,13 @@ class AnalyzerAgent:
         return pd.Series(nvi_values)
 
     # ==========================================
-    # Step 5. 여론 지형도 (Sentiment Landscape)
+    # Step 4. 여론 지형도 (Sentiment Landscape)
     # ==========================================
-    async def _build_sentiment_landscape(self, issue_id: str, post_ids: list[str]) -> dict:
+    async def _build_sentiment_landscape(
+        self,
+        comments: list[dict],
+        analysis_results: list[dict],
+    ) -> dict:
         """감성 분석 결과를 집계하여 여론 지형도 생성.
         
         출력:
@@ -407,60 +451,54 @@ class AnalyzerAgent:
           top_negative_themes: 부정 여론 핵심 주제 (LLM 클러스터링)
           top_mockery_themes: 조롱/밈 주제
         """
-        async with self.pool.acquire() as conn:
-            # 전체 감성 비율 집계
-            stats = await conn.fetchrow("""
-                SELECT
-                    COUNT(*) AS total_analyzed,
-                    COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative_count,
-                    COUNT(*) FILTER (WHERE sentiment = 'positive') AS positive_count,
-                    COUNT(*) FILTER (WHERE sentiment = 'neutral') AS neutral_count,
-                    COUNT(*) FILTER (WHERE is_mockery = TRUE) AS mockery_count,
-                    COUNT(*) FILTER (WHERE is_advocate = TRUE) AS advocate_count
-                FROM issue_cracker.analysis_results
-                WHERE issue_id = $1 AND target_type = 'comment'
-            """, issue_id)
-            
-            total = stats["total_analyzed"] or 1
-            overview = {
-                "total_analyzed": total,
-                "negative_ratio": round(stats["negative_count"] / total, 3),
-                "positive_ratio": round(stats["positive_count"] / total, 3),
-                "neutral_ratio": round(stats["neutral_count"] / total, 3),
-                "mockery_ratio": round(stats["mockery_count"] / total, 3),
-                "advocate_ratio": round(stats["advocate_count"] / total, 3),
-            }
-            
-            # 부정 댓글 상위 N건 추출 (LLM 클러스터링용)
-            neg_comments = await conn.fetch("""
-                SELECT c.body, c.like_count
-                FROM issue_cracker.analysis_results ar
-                JOIN issue_cracker.comments c ON ar.target_id = c.comment_id
-                WHERE ar.issue_id = $1
-                  AND ar.target_type = 'comment'
-                  AND ar.sentiment = 'negative'
-                ORDER BY c.like_count DESC
-                LIMIT 50
-            """, issue_id)
-            
-            # 조롱 댓글 상위 N건
-            mock_comments = await conn.fetch("""
-                SELECT c.body, c.like_count
-                FROM issue_cracker.analysis_results ar
-                JOIN issue_cracker.comments c ON ar.target_id = c.comment_id
-                WHERE ar.issue_id = $1
-                  AND ar.target_type = 'comment'
-                  AND ar.is_mockery = TRUE
-                ORDER BY c.like_count DESC
-                LIMIT 20
-            """, issue_id)
+        # 분석 결과를 집계
+        total = len(analysis_results) or 1
+        negative_count = sum(1 for a in analysis_results if a.get("sentiment") == "negative")
+        positive_count = sum(1 for a in analysis_results if a.get("sentiment") == "positive")
+        neutral_count = sum(1 for a in analysis_results if a.get("sentiment") == "neutral")
+        mockery_count = sum(1 for a in analysis_results if a.get("is_mockery"))
+        advocate_count = sum(1 for a in analysis_results if a.get("is_advocate"))
+        
+        overview = {
+            "total_analyzed": total,
+            "negative_ratio": round(negative_count / total, 3),
+            "positive_ratio": round(positive_count / total, 3),
+            "neutral_ratio": round(neutral_count / total, 3),
+            "mockery_ratio": round(mockery_count / total, 3),
+            "advocate_ratio": round(advocate_count / total, 3),
+        }
+        
+        # 댓글 원문을 comment_id로 인덱싱
+        comment_map = {c["comment_id"]: c for c in comments}
+        
+        # 부정 댓글 (좋아요 순)
+        neg_comment_dicts = []
+        for a in analysis_results:
+            if a.get("sentiment") == "negative":
+                c = comment_map.get(a["comment_id"], {})
+                neg_comment_dicts.append({
+                    "body": c.get("body", ""),
+                    "like_count": c.get("like_count", 0),
+                })
+        neg_comment_dicts.sort(key=lambda x: x["like_count"], reverse=True)
+        
+        # 조롱 댓글 (좋아요 순)
+        mock_comment_dicts = []
+        for a in analysis_results:
+            if a.get("is_mockery"):
+                c = comment_map.get(a["comment_id"], {})
+                mock_comment_dicts.append({
+                    "body": c.get("body", ""),
+                    "like_count": c.get("like_count", 0),
+                })
+        mock_comment_dicts.sort(key=lambda x: x["like_count"], reverse=True)
         
         # LLM으로 부정 주제 클러스터링
         top_negative_themes = await self._cluster_themes(
-            [dict(r) for r in neg_comments], "부정 여론"
+            neg_comment_dicts[:50], "부정 여론"
         )
         top_mockery_themes = await self._cluster_themes(
-            [dict(r) for r in mock_comments], "조롱/밈"
+            mock_comment_dicts[:20], "조롱/밈"
         )
         
         return {
@@ -481,120 +519,114 @@ class AnalyzerAgent:
         
         prompt = f"""[{category}] 댓글들을 분석하여 핵심 주제 3~5개로 클러스터링하세요.
 
-각 클러스터에 대해 JSON 배열로 답하세요:
-[{{
-  "theme": "주제명 (한글, 10자 이내)",
-  "estimated_ratio": 0.35,
-  "representative_comment": "대표 댓글 원문 (원본 그대로)",
-  "intensity": "high" | "medium" | "low"
-}}]
-
 [댓글 목록]
 {comments_text}"""
         
         try:
-            res = self.client.models.generate_content(
+            res = await asyncio.to_thread(
+                self.client.models.generate_content,
                 model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                    response_schema=ThemeClusterList,
                     temperature=0.2,
                 )
             )
-            return json.loads(res.text)
+            parsed = json.loads(res.text)
+            return parsed.get("clusters", [])
         except Exception as e:
             print(f"   [WARN] 테마 클러스터링 실패: {e}")
             return []
 
     # ==========================================
-    # Step 6. 감성 타임라인 (Sentiment Timeline)
+    # Step 5. 감성 타임라인 (Sentiment Timeline)
     # ==========================================
-    async def _build_sentiment_timeline(self, issue_id: str) -> dict:
+    def _build_sentiment_timeline(
+        self,
+        comments: list[dict],
+        analysis_results: list[dict],
+        posts: list[dict],
+        post_scores: dict[str, int],
+    ) -> dict:
         """시간별 감성 구성 + 이벤트 마커를 생성.
         
         출력:
           history: [각 시간 버킷의 감성 분포]
           events: [주요 이벤트 마커 (KOL 저격, 기업 대응 등)]
         """
-        async with self.pool.acquire() as conn:
-            # 시간별 감성 구성
-            hourly = await conn.fetch("""
-                SELECT
-                    date_trunc('hour', c.created_at) AS hour_bucket,
-                    COUNT(*) AS total_mentions,
-                    ROUND(
-                        COUNT(*) FILTER (WHERE ar.sentiment = 'negative')::NUMERIC
-                        / NULLIF(COUNT(ar.id), 0), 3
-                    ) AS negative_ratio,
-                    ROUND(
-                        COUNT(*) FILTER (WHERE ar.is_mockery = TRUE)::NUMERIC
-                        / NULLIF(COUNT(ar.id), 0), 3
-                    ) AS mockery_ratio,
-                    ROUND(
-                        COUNT(*) FILTER (WHERE ar.is_advocate = TRUE)::NUMERIC
-                        / NULLIF(COUNT(ar.id), 0), 3
-                    ) AS advocate_ratio
-                FROM issue_cracker.comments c
-                JOIN issue_cracker.analysis_results ar
-                    ON ar.target_type = 'comment'
-                    AND ar.target_id = c.comment_id
-                    AND ar.issue_id = $1
-                GROUP BY date_trunc('hour', c.created_at)
-                ORDER BY hour_bucket
-            """, issue_id)
-            
-            # 이벤트 마커: 인플루언서 저격 (influence_score >= 2인 posts)
-            events = await conn.fetch("""
-                SELECT
-                    p.created_at,
-                    p.author_name,
-                    p.platform,
-                    p.title,
-                    p.view_count,
-                    p.author_followers
-                FROM issue_cracker.posts p
-                JOIN issue_cracker.analysis_results ar
-                    ON ar.target_type = 'post'
-                    AND ar.target_id = p.post_id
-                    AND ar.issue_id = $1
-                WHERE ar.influence_score >= 2
-                ORDER BY p.created_at
-            """, issue_id)
+        if not comments or not analysis_results:
+            return {"history": [], "events": []}
         
-        # 과거 데이터 조립
-        if not hourly:
-            first_hour = None
-        else:
-            first_hour = hourly[0]["hour_bucket"]
+        # 분석 결과 인덱싱
+        analysis_map = {a["comment_id"]: a for a in analysis_results}
+        
+        # 댓글 DataFrame
+        df = pd.DataFrame(comments)
+        df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+        df["hour_bucket"] = df["created_at"].dt.floor("h")
+        
+        # 감성 병합
+        df["sentiment"] = df["comment_id"].map(
+            lambda cid: analysis_map.get(cid, {}).get("sentiment")
+        )
+        df["is_mockery"] = df["comment_id"].map(
+            lambda cid: analysis_map.get(cid, {}).get("is_mockery", False)
+        )
+        df["is_advocate"] = df["comment_id"].map(
+            lambda cid: analysis_map.get(cid, {}).get("is_advocate", False)
+        )
+        
+        analyzed = df[df["sentiment"].notna()]
+        
+        if analyzed.empty:
+            return {"history": [], "events": []}
+        
+        # 시간별 감성 구성
+        hourly = analyzed.groupby("hour_bucket").agg(
+            total_mentions=("comment_id", "count"),
+            negative_count=("sentiment", lambda x: (x == "negative").sum()),
+            mockery_count=("is_mockery", "sum"),
+            advocate_count=("is_advocate", "sum"),
+        ).reset_index().sort_values("hour_bucket")
+        
+        first_hour = hourly["hour_bucket"].min()
         
         history = []
-        for row in hourly:
-            hour_offset = 0
-            if first_hour:
-                hour_offset = int((row["hour_bucket"] - first_hour).total_seconds() / 3600)
+        for _, row in hourly.iterrows():
+            total = row["total_mentions"] or 1
+            hour_offset = int(
+                (row["hour_bucket"] - first_hour).total_seconds() / 3600
+            )
             history.append({
                 "hour": hour_offset,
                 "timestamp": row["hour_bucket"].isoformat(),
-                "total_mentions": row["total_mentions"],
-                "negative_ratio": float(row["negative_ratio"] or 0),
-                "mockery_ratio": float(row["mockery_ratio"] or 0),
-                "advocate_ratio": float(row["advocate_ratio"] or 0),
+                "total_mentions": int(row["total_mentions"]),
+                "negative_ratio": round(row["negative_count"] / total, 3),
+                "mockery_ratio": round(row["mockery_count"] / total, 3),
+                "advocate_ratio": round(row["advocate_count"] / total, 3),
             })
         
-        # 이벤트 마커 조립
+        # 이벤트 마커: 인플루언서 저격 (influence_score >= 2인 posts)
         event_markers = []
-        for evt in events:
-            hour_offset = 0
-            if first_hour:
-                hour_offset = int((evt["created_at"] - first_hour).total_seconds() / 3600)
-            event_markers.append({
-                "hour": hour_offset,
-                "timestamp": evt["created_at"].isoformat(),
-                "type": "influencer_hit",
-                "label": f"{evt['author_name']} ({evt['platform']}) - {evt['title'][:40]}",
-                "view_count": evt["view_count"],
-                "followers": evt["author_followers"],
-            })
+        for p in posts:
+            score = post_scores.get(p["post_id"], 0)
+            if score >= 2:
+                p_time = pd.Timestamp(p["created_at"])
+                hour_offset = int(
+                    (p_time - first_hour).total_seconds() / 3600
+                )
+                event_markers.append({
+                    "hour": hour_offset,
+                    "timestamp": p["created_at"],
+                    "type": "influencer_hit",
+                    "label": (
+                        f"{p.get('author_name', '?')} ({p.get('platform', '?')}) "
+                        f"- {p.get('title', '')[:40]}"
+                    ),
+                    "view_count": p.get("view_count", 0),
+                    "followers": p.get("author_followers", 0),
+                })
         
         return {
             "history": history,
@@ -602,9 +634,13 @@ class AnalyzerAgent:
         }
 
     # ==========================================
-    # Step 7. KOL (Key Opinion Leader) 식별
+    # Step 6. KOL (Key Opinion Leader) 식별
     # ==========================================
-    async def _identify_kols(self, issue_id: str, post_ids: list[str]) -> list[dict]:
+    async def _identify_kols(
+        self,
+        posts: list[dict],
+        post_scores: dict[str, int],
+    ) -> list[dict]:
         """영향력 높은 작성자(KOL)를 식별하고 LLM으로 성향/대응 권고를 생성.
         
         식별 기준:
@@ -616,53 +652,31 @@ class AnalyzerAgent:
             "influence_score", "key_content", "view_count", 
             "estimated_reach", "risk_assessment"}, ...]
         """
-        if not post_ids:
-            return []
+        # influence_score >= 1인 posts 필터링 + 조회수 순 정렬
+        kol_posts = [
+            p for p in posts
+            if post_scores.get(p["post_id"], 0) >= 1
+        ]
+        kol_posts.sort(key=lambda p: p.get("view_count", 0), reverse=True)
+        kol_posts = kol_posts[:10]
         
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT
-                    p.author_name,
-                    p.platform::TEXT,
-                    p.author_followers,
-                    p.view_count,
-                    p.share_count,
-                    p.title,
-                    p.body,
-                    p.url,
-                    ar.influence_score
-                FROM issue_cracker.posts p
-                JOIN issue_cracker.analysis_results ar
-                    ON ar.target_type = 'post'
-                    AND ar.target_id = p.post_id
-                    AND ar.issue_id = $1
-                WHERE p.post_id = ANY($2)
-                  AND ar.influence_score >= 1
-                ORDER BY p.view_count DESC
-                LIMIT 10
-            """, issue_id, post_ids)
-        
-        if not rows:
+        if not kol_posts:
             return []
         
         # LLM으로 각 KOL의 성향(stance)과 대응 권고(risk_assessment) 생성
         kol_texts = []
-        for i, row in enumerate(rows):
-            body_snippet = (row["body"] or "")[:200]
+        for i, p in enumerate(kol_posts):
+            body_snippet = (p.get("body") or "")[:200]
             kol_texts.append(
-                f"[{i+1}] author={row['author_name']}, platform={row['platform']}, "
-                f"followers={row['author_followers']:,}, views={row['view_count']:,}, "
-                f"title=\"{row['title'][:80]}\"\n    내용: {body_snippet}"
+                f"[{i+1}] author={p.get('author_name', '?')}, "
+                f"platform={p.get('platform', '?')}, "
+                f"followers={p.get('author_followers', 0):,}, "
+                f"views={p.get('view_count', 0):,}, "
+                f"title=\"{p.get('title', '')[:80]}\"\n"
+                f"    내용: {body_snippet}"
             )
         
         prompt = f"""아래 온라인 콘텐츠 작성자들의 이슈에 대한 성향(stance)과 리스크 평가를 분석하세요.
-
-각 작성자에 대해 JSON 배열로 답하세요:
-[{{
-  "index": 1,
-  "stance": "hostile" | "neutral" | "supportive",
-  "risk_assessment": "해당 작성자의 향후 행동 예측 및 대응 권고 (1~2문장)"
-}}]
 
 stance 기준:
 - hostile: 기업에 대해 적대적/비판적
@@ -673,15 +687,18 @@ stance 기준:
 {chr(10).join(kol_texts)}"""
         
         try:
-            res = self.client.models.generate_content(
+            res = await asyncio.to_thread(
+                self.client.models.generate_content,
                 model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
+                    response_schema=KOLStanceList,
                     temperature=0.2,
                 )
             )
-            stance_results = json.loads(res.text)
+            parsed = json.loads(res.text)
+            stance_results = parsed.get("results", [])
         except Exception as e:
             print(f"   [WARN] KOL 성향 분석 실패: {e}")
             stance_results = []
@@ -690,18 +707,20 @@ stance 기준:
         stance_map = {s["index"]: s for s in stance_results if isinstance(s, dict)}
         
         kols = []
-        for i, row in enumerate(rows):
+        for i, p in enumerate(kol_posts):
             stance_info = stance_map.get(i + 1, {})
-            estimated_reach = row["view_count"] + (row["share_count"] or 0) * 50
+            estimated_reach = (
+                p.get("view_count", 0) + (p.get("share_count", 0) or 0) * 50
+            )
             
             kols.append({
-                "author_name": row["author_name"],
-                "platform": row["platform"],
-                "followers": row["author_followers"],
-                "view_count": row["view_count"],
-                "influence_score": row["influence_score"],
-                "key_content": row["title"][:100],
-                "url": row["url"],
+                "author_name": p.get("author_name", "?"),
+                "platform": p.get("platform", "?"),
+                "followers": p.get("author_followers", 0),
+                "view_count": p.get("view_count", 0),
+                "influence_score": post_scores.get(p["post_id"], 0),
+                "key_content": p.get("title", "")[:100],
+                "url": p.get("url", ""),
                 "estimated_reach": estimated_reach,
                 "stance": stance_info.get("stance", "unknown"),
                 "risk_assessment": stance_info.get("risk_assessment", ""),
@@ -718,6 +737,7 @@ class BatchAnalyzer:
     GCS에 JSONL 업로드 → Batch Job 제출 → Polling → 결과 반영.
     
     실시간 파이프라인이 아닌 초기 대량 투입 시 사용합니다.
+    주의: 이 클래스는 DB 의존성이 있음 (오프라인 배치 처리 전용).
     """
     
     def __init__(self, client, model_name: str, db_pool,
@@ -729,65 +749,73 @@ class BatchAnalyzer:
         self.project_id = project_id
         self.location = location
     
-    async def run_batch(self, issue_id: str, poll_interval: int = 60):
+    async def run_batch(self, issue_id: str, post_ids: list[str] = None, poll_interval: int = 60):
         """
-        1. DB에서 미분석 댓글 로드
+        1. DB에서 미분석 댓글 로드 (Retriever가 확보한 post_ids 기준)
         2. JSONL 생성 → GCS 업로드
         3. Batch Job 제출
         4. Polling으로 완료 대기
         5. 결과 다운로드 → DB 반영
         """
-
+        post_ids = post_ids or []
         
-        comments = await self._load_unanalyzed(issue_id)
+        comments = await self._load_unanalyzed(issue_id, post_ids)
         if not comments:
             print("   [BATCH] No unanalyzed comments")
             return
         
         print(f"   [BATCH] {len(comments)}건 Batch Prediction 시작...")
         
-        # 1. JSONL 생성 (50건씩 배치)
-        jsonl_lines = self._build_jsonl(comments)
+        # 1. JSONL 생성
+        lines = self._build_jsonl(comments)
         
         # 2. GCS 업로드
-        gcs_input = f"gs://{self.gcs_bucket}/batch_input/{issue_id}.jsonl"
-        gcs_output = f"gs://{self.gcs_bucket}/batch_output/{issue_id}/"
-        
         storage_client = storage.Client(project=self.project_id)
         bucket = storage_client.bucket(self.gcs_bucket)
-        blob = bucket.blob(f"batch_input/{issue_id}.jsonl")
-        blob.upload_from_string("\n".join(jsonl_lines), content_type="application/jsonl")
+        input_path = f"batch_input/{issue_id}/input.jsonl"
+        blob = bucket.blob(input_path)
+        blob.upload_from_string("\n".join(lines), content_type="application/jsonl")
+        
+        gcs_input = f"gs://{self.gcs_bucket}/{input_path}"
+        gcs_output = f"gs://{self.gcs_bucket}/batch_output/{issue_id}/"
         
         # 3. Batch Job 제출
         aiplatform.init(project=self.project_id, location=self.location)
         
-        batch_job = aiplatform.BatchPredictionJob.create(
+        job = aiplatform.BatchPredictionJob.create(
+            job_display_name=f"issue-cracker-{issue_id}",
             model_name=f"publishers/google/models/{self.model_name}",
             gcs_source=gcs_input,
             gcs_destination_prefix=gcs_output,
             sync=False,
         )
         
-        print(f"   [BATCH] Job submitted: {batch_job.resource_name}")
+        print(f"   [BATCH] Job 제출 완료: {job.resource_name}")
         
         # 4. Polling
-        while batch_job.state not in ("JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED"):
+        while job.state not in ("JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED",
+                                 "JOB_STATE_CANCELLED"):
             await asyncio.sleep(poll_interval)
-            batch_job.refresh()
-            print(f"   [BATCH] Status: {batch_job.state}")
+            job = aiplatform.BatchPredictionJob(job.resource_name)
+            print(f"   [BATCH] 상태: {job.state}")
         
-        if batch_job.state != "JOB_STATE_SUCCEEDED":
-            raise RuntimeError(f"Batch job failed: {batch_job.state}")
+        if job.state != "JOB_STATE_SUCCEEDED":
+            print(f"   [BATCH] ❌ 실패: {job.state}")
+            return
         
         # 5. 결과 반영
         await self._apply_batch_results(gcs_output, issue_id)
-        print(f"   [BATCH] {len(comments)}건 분석 완료")
+        print("   [BATCH] ✅ 완료, 결과 DB 반영")
     
     def _build_jsonl(self, comments: list[dict]) -> list[str]:
-        """댓글들을 50건씩 묶어 Batch JSONL 형식으로 변환."""
+        """배치 입력 JSONL 생성."""
+        batches = [
+            comments[i:i + 50]
+            for i in range(0, len(comments), 50)
+        ]
+        
         lines = []
-        for i in range(0, len(comments), 50):
-            batch = comments[i:i + 50]
+        for batch in batches:
             comments_text = "\n".join(
                 f"[{c['comment_id']}] {c['body'][:200]}" for c in batch
             )
@@ -807,7 +835,10 @@ class BatchAnalyzer:
             lines.append(json.dumps(request, ensure_ascii=False))
         return lines
     
-    async def _load_unanalyzed(self, issue_id: str) -> list[dict]:
+    async def _load_unanalyzed(self, issue_id: str, post_ids: list[str]) -> list[dict]:
+        """Retriever가 확보한 posts의 댓글 중, 이 issue에서 미분석인 것만 로드."""
+        if not post_ids:
+            return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT c.comment_id, c.body, c.like_count, c.reply_count
@@ -815,11 +846,12 @@ class BatchAnalyzer:
                 LEFT JOIN issue_cracker.analysis_results ar
                     ON ar.target_type = 'comment'
                     AND ar.target_id = c.comment_id
-                    AND ar.model_version = $2
-                WHERE c.issue_id = $1
+                    AND ar.issue_id = $1
+                    AND ar.model_version = $3
+                WHERE c.post_id = ANY($2)
                   AND ar.id IS NULL
                 ORDER BY c.created_at
-            """, issue_id, self.model_name)
+            """, issue_id, post_ids, self.model_name)
         return [dict(r) for r in rows]
     
     async def _apply_batch_results(self, gcs_output: str, issue_id: str):
@@ -853,7 +885,7 @@ class BatchAnalyzer:
                          sentiment, sentiment_score, is_mockery, is_advocate,
                          model_version)
                     VALUES ($1, 'comment', $2, $3, $4, $5, $6, $7)
-                    ON CONFLICT (target_type, target_id, model_version) DO NOTHING
+                    ON CONFLICT (issue_id, target_type, target_id, model_version) DO NOTHING
                 """, [
                     (issue_id, a["comment_id"], a["sentiment"],
                      a["sentiment_score"], a["is_mockery"], a["is_advocate"],
