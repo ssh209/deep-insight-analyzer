@@ -238,7 +238,7 @@ Issue_Cracker/
 
 ### 사전 요구사항
 
-- **Python** 3.12
+- **Python** 3.12.xx
 - **Google Cloud** 프로젝트 및 Vertex AI API 활성화
 - **Graphviz** 시스템 설치 ([다운로드](https://graphviz.org/download/))
 
@@ -246,19 +246,9 @@ Issue_Cracker/
 
 > Poetry가 이미 설치되어 있다면 이 단계를 건너뛰세요.
 
-**Windows (PowerShell)**
-
 ```powershell
-(Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | python -
+pip install poetry
 ```
-
-**macOS / Linux**
-
-```bash
-curl -sSL https://install.python-poetry.org | python3 -
-```
-
-설치 후 터미널을 재시작하고 버전을 확인합니다:
 
 ```bash
 poetry --version   # Poetry (version 2.x.x)
@@ -270,7 +260,7 @@ poetry --version   # Poetry (version 2.x.x)
 
 ```bash
 git clone <repository-url>
-cd Issue_Cracker
+cd deep-insight-analyzer
 
 # 가상환경을 프로젝트 폴더 내(.venv/)에 생성하도록 설정
 poetry config virtualenvs.in-project true
