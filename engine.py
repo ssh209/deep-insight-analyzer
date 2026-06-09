@@ -60,8 +60,9 @@ async def init_infrastructure():
         if not schema_ok:
             logger.warning(
                 "⚠️ DB 스키마가 준비되지 않았습니다. "
-                "Collector의 schema_collection.sql + Analyzer의 sql/001_create_tables.sql을 "
-                "실행 후 재시작하세요. 현재는 CSV 모드로 동작합니다."
+                "deep-insight-database 프로젝트에서 "
+                "'python scripts/migrate.py'를 실행 후 재시작하세요. "
+                "현재는 CSV 모드로 동작합니다."
             )
             await close_db_pool(db_pool)
             db_pool = None
