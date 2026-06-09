@@ -54,10 +54,11 @@ CREATE TABLE deep_insight.issues (
 
 
 -- ==========================================
--- [2] 📊 Analysis Results — 감성 분류 + 영향력 스코어
+-- [2] 📊 Analysis Results — 감성 분류 + 영향력 스코어 + 원문 톤
 --
---     target_type = 'doc' → collected_doc.doc_id 참조
---     target_type = 'comment' → collected_doc_comment.comment_id 참조
+--     target_type = 'doc'      → collected_doc.doc_id 참조 (영향력 스코어)
+--     target_type = 'comment'  → collected_doc_comment.comment_id 참조 (감성 분류)
+--     target_type = 'doc_tone' → collected_doc.doc_id 참조 (원문 톤 분류)
 --
 --     같은 대상도 issue마다 다른 관점으로 분석 가능
 -- ==========================================
@@ -65,16 +66,24 @@ CREATE TABLE deep_insight.analysis_results (
     id              BIGSERIAL   PRIMARY KEY,
     issue_id        UUID        NOT NULL REFERENCES deep_insight.issues (issue_id) ON DELETE CASCADE,
 
-    target_type     TEXT        NOT NULL CHECK (target_type IN ('doc', 'comment')),
+    target_type     TEXT        NOT NULL CHECK (target_type IN ('doc', 'comment', 'doc_tone')),
     target_id       BIGINT      NOT NULL,               -- doc_id 또는 comment_id (BIGINT)
 
-    -- 감성 분류
-    sentiment       TEXT        CHECK (sentiment IN ('positive', 'negative', 'neutral')),
+    -- 감성/톤 분류
+    -- comment: positive/negative/neutral
+    -- doc_tone: hostile/critical/neutral/sympathetic/supportive
+    sentiment       TEXT        CHECK (sentiment IN (
+        'positive', 'negative', 'neutral',
+        'hostile', 'critical', 'sympathetic', 'supportive'
+    )),
     sentiment_score REAL,
 
     -- 댓글 특화
     is_mockery      BOOLEAN     DEFAULT FALSE,
     is_advocate     BOOLEAN     DEFAULT FALSE,
+
+    -- 원문 톤 특화 (저격/폭로 콘텐츠 여부)
+    is_attack_content BOOLEAN   DEFAULT FALSE,
 
     -- 문서 특화 (영향력 점수)
     influence_score SMALLINT,

@@ -14,17 +14,18 @@ from db import close_db_pool
 # ==========================================
 @st.cache_resource
 def setup_backend():
-    client, vector_db, embeddings, db_pool = asyncio.run(init_infrastructure())
+    loop = asyncio.new_event_loop()
+    client, vector_db, embeddings, db_pool = loop.run_until_complete(init_infrastructure())
     app_graph = build_graph(client, vector_db, embeddings, db_pool)
-    return app_graph, db_pool
+    return app_graph, db_pool, loop
 
-app_graph, _db_pool = setup_backend()
+app_graph, _db_pool, _loop = setup_backend()
 
 # ==========================================
 # 🔄 파이프라인 노드 정의 (공통 상수)
 # ==========================================
 PIPELINE_ORDER = [
-    "query_builder", "retriever",
+    "query_builder", "retriever", "analyzer",
     "baseline_forecaster", "planner", "strategist", 
     "mitigated_forecaster", "analyst", "compiler", "reviewer"
 ]
@@ -32,6 +33,7 @@ PIPELINE_ORDER = [
 NODE_LABELS = {
     "query_builder": "Query Builder",
     "retriever": "Data Retriever",
+    "analyzer": "Sentiment Analyzer",
     "baseline_forecaster": "Baseline Forecaster",
     "planner": "Report Planner",
     "strategist": "Strategist",
@@ -188,24 +190,47 @@ with st.sidebar:
     agent_log_container = st.container()
 
 if start_btn:
-    # 초기 상태
+    # Issue ID 생성 (DB 모드: INSERT → UUID, CSV 모드: uuid4)
+    if _db_pool is not None:
+        async def _create_issue():
+            async with _db_pool.acquire() as conn:
+                return await conn.fetchval("""
+                    INSERT INTO deep_insight.issues (user_input, issue_type, status)
+                    VALUES ($1, $2, 'analyzing')
+                    RETURNING issue_id::text
+                """, input_metadata, selected_crisis_type)
+        issue_id = _loop.run_until_complete(_create_issue())
+    else:
+        import uuid as _uuid
+        issue_id = str(_uuid.uuid4())
+
+    # 초기 상태 (PipelineState 전체 필드)
     current_state = {
-        "issue_id": "",
+        "issue_id": issue_id,
         "train_csv_path": "data/pr_crisis_dataset.csv",
         "input_csv_path": target_csv,
         "crisis_context": input_metadata,
         "crisis_type": selected_crisis_type,
+        "forecaster_model": "lightgbm",
         "search_keywords": [],
         "search_queries": [],
         "search_embeddings": [],
         "search_time_hint": "",
         "retrieved_doc_ids": [],
+        "retrieved_docs": [],
+        "retrieved_comments": [],
         "retrieved_comment_count": 0,
+        "sentiment_landscape": {},
+        "sentiment_timeline": {},
+        "key_opinion_leaders": [],
         "actual_nvi_history": [],
         "nvi_baseline_forecast": [],
         "nvi_mitigated_forecast": [],
         "strategist_timeline": [],
         "strategist_draft": "",
+        "risk_matrix": [],
+        "draft_statements": [],
+        "benchmark_cases": [],
         "planner_instructions": "",
         "analyst_draft": "",
         "draft_report": "", 
@@ -243,7 +268,15 @@ if start_btn:
     # ==========================================
     # 🚀 파이프라인 실행 루프
     # ==========================================
-    for event in app_graph.stream(current_state):
+    # async 노드(Retriever, Analyzer) 대응 — astream으로 수집 후 순차 처리
+    async def _collect_events():
+        events = []
+        async for event in app_graph.astream(current_state):
+            events.append(event)
+        return events
+
+    pipeline_events = _loop.run_until_complete(_collect_events())
+    for event in pipeline_events:
         finished_nodes = list(event.keys())
         is_rejected = False
         
@@ -255,7 +288,10 @@ if start_btn:
                 with st.expander(f"{'❌' if node_name == 'reviewer' and not node_output.get('is_approved', False) else '✅'} {NODE_LABELS.get(node_name, node_name)}", expanded=False):
                     for key, value in node_output.items():
                         if isinstance(value, list) and len(value) > 10:
-                            st.markdown(f"**{key}**: `[{len(value)} items]` min={min(value):.3f}, max={max(value):.3f}")
+                            try:
+                                st.markdown(f"**{key}**: `[{len(value)} items]` min={min(value):.3f}, max={max(value):.3f}")
+                            except (TypeError, ValueError):
+                                st.markdown(f"**{key}**: `[{len(value)} items]`")
                         elif isinstance(value, str) and len(value) > 200:
                             st.markdown(f"**{key}**:")
                             st.text(value[:500] + ("..." if len(value) > 500 else ""))

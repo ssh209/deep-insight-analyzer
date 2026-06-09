@@ -48,7 +48,11 @@ dependencies = [
 
     # --- 데이터베이스 및 유효성 검사 ---
     "asyncpg",
-    "pydantic"
+    "pydantic",
+
+    # --- 트레이싱 및 환경변수 ---
+    "langsmith",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]

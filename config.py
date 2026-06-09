@@ -5,6 +5,10 @@
 Fargate 배포 시: ECS Task Definition의 환경변수 / Secrets Manager
 """
 import os
+from dotenv import load_dotenv
+
+# .env 파일 자동 로딩 (없으면 무시)
+load_dotenv()
 
 # ==========================================
 # 🔑 GCP / Vertex AI
@@ -38,10 +42,18 @@ COMPILER_MODEL = os.environ.get("COMPILER_MODEL", PRO_MODEL)
 REVIEWER_MODEL = os.environ.get("REVIEWER_MODEL", PRO_MODEL)
 
 # ==========================================
-# 📊 데이터 경로
+# 📂 데이터 / 출력 경로
 # ==========================================
 TRAIN_CSV_PATH = os.environ.get("TRAIN_CSV_PATH", "data/pr_crisis_dataset.csv")
 INPUT_CSV_PATH = os.environ.get("INPUT_CSV_PATH", "data/input_crisis_72h.csv")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")          # Analyzer CSV 출력
+REPORT_DIR = os.environ.get("REPORT_DIR", "reports")         # HTML 보고서 로컬 저장
+
+# LightGBM 모델
+LGBM_MODEL_PATH = os.environ.get("LGBM_MODEL_PATH", "models/lightgbm/nvi_forecaster.pkl")
+
+# TFT 모델
+TFT_MODEL_PATH = os.environ.get("TFT_MODEL_PATH", "models/tft/tft_nvi.ckpt")
 
 # ==========================================
 # 🗄️ Database (외부 PostgreSQL 연결)
@@ -61,6 +73,11 @@ EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
 # 🔮 Forecaster Model
 # ==========================================
 FORECASTER_MODEL = os.environ.get("FORECASTER_MODEL", "lightgbm")  # "lightgbm" | "tft" | "moirai" | "arima"
+
+# ==========================================
+# 📄 Report (HTML 보고서 → GCS 업로드)
+# ==========================================
+GCS_REPORT_BUCKET = os.environ.get("GCS_REPORT_BUCKET", "")  # 비어있으면 로컬 저장만
 
 # ==========================================
 # 🌐 Streamlit

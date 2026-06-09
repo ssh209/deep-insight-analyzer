@@ -28,8 +28,8 @@ from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "models")
-TFT_CHECKPOINT = os.path.join(MODEL_DIR, "tft_nvi.ckpt")
+from config import TFT_MODEL_PATH
+TFT_CHECKPOINT = TFT_MODEL_PATH
 
 # ==========================================
 # 피처 정의

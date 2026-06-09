@@ -12,8 +12,9 @@ import joblib
 from lightgbm import LGBMRegressor
 
 from state import PipelineState
+from config import LGBM_MODEL_PATH
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", "nvi_forecaster.pkl")
+MODEL_PATH = LGBM_MODEL_PATH
 
 # ==========================================
 # 📊 SCCT 위기 유형별 감쇠 파라미터 프리셋
@@ -41,6 +42,13 @@ CRISIS_DECAY_PARAMS = {
         "action_2_mockery": 0.85,
         "action_2_advocate": 1.08,
         "action_2_advocate_ceiling": 0.7,
+        # 원문 톤 감쇠 파라미터
+        "doc_hostile_decay": 0.96,       # hostile 비율 자연 감쇠 (빠름)
+        "doc_hostile_floor": 0.03,       # 하한
+        "doc_supportive_growth": 1.008,  # supportive 비율 자연 성장 (빠름)
+        "doc_supportive_ceiling": 0.45,  # 상한
+        "action_2_doc_hostile": 0.88,    # CEO 사과 시 hostile 감소 (효과 큼)
+        "action_2_doc_supportive": 1.10, # CEO 사과 시 supportive 증가 (효과 큼)
     },
     "accidental": {
         # 사고형 (리콜, 기술적 결함, 장비 고장)
@@ -58,6 +66,13 @@ CRISIS_DECAY_PARAMS = {
         "action_2_mockery": 0.90,
         "action_2_advocate": 1.05,
         "action_2_advocate_ceiling": 0.6,
+        # 원문 톤 감쇠 파라미터
+        "doc_hostile_decay": 0.985,
+        "doc_hostile_floor": 0.05,
+        "doc_supportive_growth": 1.004,
+        "doc_supportive_ceiling": 0.35,
+        "action_2_doc_hostile": 0.92,
+        "action_2_doc_supportive": 1.06,
     },
     "preventable": {
         # 예방가능형 (경영진 비리, 안전 규정 위반, 의도적 은폐)
@@ -75,6 +90,13 @@ CRISIS_DECAY_PARAMS = {
         "action_2_mockery": 0.96,
         "action_2_advocate": 1.02,
         "action_2_advocate_ceiling": 0.35,
+        # 원문 톤 감쇠 파라미터 (Sticky Crisis: 감쇠 매우 느림)
+        "doc_hostile_decay": 0.998,
+        "doc_hostile_floor": 0.10,       # 하한 높음 (적대적 콘텐츠 잔존)
+        "doc_supportive_growth": 1.001,
+        "doc_supportive_ceiling": 0.20,  # 상한 낮음 (옹호 어려움)
+        "action_2_doc_hostile": 0.97,    # CEO 사과해도 hostile 거의 안 줄음
+        "action_2_doc_supportive": 1.02,
     },
 }
 
@@ -138,8 +160,14 @@ class LightGBMForecasterAgent:
 
         features = [
             'Hours_Since_Start', 'Company_Action_Type', 'Influencer_Impact',
-            'Negative_Ratio', 'Mockery_Index', 'Advocate_Ratio', 'Negative_Momentum'
+            'Negative_Ratio', 'Mockery_Index', 'Advocate_Ratio', 'Negative_Momentum',
+            'Doc_Hostile_Ratio', 'Doc_Supportive_Ratio', 'Narrative_Pressure',
         ]
+
+        # 구버전 CSV 호환: 새 피처가 없으면 기본값 0으로 채움
+        for feat in features:
+            if feat not in df.columns:
+                df[feat] = 0.0
 
         X_train = df[features]
         y_train = df['Actual_NVI']
@@ -177,23 +205,48 @@ class LightGBMForecasterAgent:
             test_X.loc[mask, 'Company_Action_Type'] = evt['action_type']
             test_X.loc[mask, 'Influencer_Impact'] = evt['influencer_hit']
 
-        # SCCT 동적 감쇠 시뮬레이션
+        # SCCT 동적 감쇠 시뮬레이션 — 댓글 감성
         current_neg_ratio = float(df.iloc[-1]['Negative_Ratio'])
         current_mockery = float(df.iloc[-1]['Mockery_Index'])
         current_advocate = float(df.iloc[-1]['Advocate_Ratio'])
         current_momentum = float(df.iloc[-1]['Negative_Momentum'])
 
+        # SCCT 동적 감쇠 시뮬레이션 — 원문 톤
+        current_doc_hostile = float(df.iloc[-1].get('Doc_Hostile_Ratio', 0.0))
+        current_doc_supportive = float(df.iloc[-1].get('Doc_Supportive_Ratio', 0.0))
+
         for idx in test_X.index:
             action = test_X.loc[idx, 'Company_Action_Type']
+
+            # --- 댓글 감성 감쇠 (기존) ---
             current_momentum = current_momentum * params["momentum_decay"]
             current_neg_ratio = max(params["neg_ratio_floor"], current_neg_ratio * params["neg_ratio_decay"])
             current_mockery = max(params["mockery_floor"], current_mockery * params["mockery_decay"])
             current_advocate = min(params["advocate_ceiling"], current_advocate * params["advocate_growth"])
 
+            # --- 원문 톤 감쇠 (신규) ---
+            current_doc_hostile = max(
+                params.get("doc_hostile_floor", 0.05),
+                current_doc_hostile * params.get("doc_hostile_decay", 0.985)
+            )
+            current_doc_supportive = min(
+                params.get("doc_supportive_ceiling", 0.35),
+                current_doc_supportive * params.get("doc_supportive_growth", 1.004)
+            )
+
             if action == 2:
+                # CEO 사과/리콜 → 댓글 감성 + 원문 톤 동시 반영
                 current_neg_ratio = max(params["neg_ratio_floor"], current_neg_ratio * params["action_2_neg"])
                 current_mockery = max(params["mockery_floor"], current_mockery * params["action_2_mockery"])
                 current_advocate = min(params["action_2_advocate_ceiling"], current_advocate * params["action_2_advocate"])
+                current_doc_hostile = max(
+                    params.get("doc_hostile_floor", 0.05),
+                    current_doc_hostile * params.get("action_2_doc_hostile", 0.92)
+                )
+                current_doc_supportive = min(
+                    params.get("doc_supportive_ceiling", 0.35),
+                    current_doc_supportive * params.get("action_2_doc_supportive", 1.06)
+                )
             elif action == 1:
                 current_mockery = max(params["mockery_floor"], current_mockery * params["action_1_mockery"])
 
@@ -202,6 +255,20 @@ class LightGBMForecasterAgent:
             test_X.loc[idx, 'Advocate_Ratio'] = current_advocate
             test_X.loc[idx, 'Negative_Momentum'] = current_momentum
 
-        test_X = test_X.astype(float)
+            # 원문 톤 피처 설정
+            test_X.loc[idx, 'Doc_Hostile_Ratio'] = current_doc_hostile
+            test_X.loc[idx, 'Doc_Supportive_Ratio'] = current_doc_supportive
+            # Narrative_Pressure는 간소화 산출 (critical/sympathetic 정보 없으므로 hostile/supportive만 사용)
+            test_X.loc[idx, 'Narrative_Pressure'] = (
+                current_doc_hostile * 0.12
+                - current_doc_supportive * 0.10
+            )
+
+        # 구버전 모델 호환: 모델이 기대하는 피처 중 누락된 것은 0으로 채움
+        for feat in features:
+            if feat not in test_X.columns:
+                test_X[feat] = 0.0
+
+        test_X = test_X[features].astype(float)
         forecast = model.predict(test_X)
         return np.clip(forecast, 0.1, 1.0).round(3).tolist()

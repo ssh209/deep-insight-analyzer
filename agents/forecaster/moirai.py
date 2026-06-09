@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 import torch
 from gluonts.dataset.pandas import PandasDataset
-from uni2ts.model.moirai2 import Moirai2Forecast, Moirai2Module
+from uni2ts.model.moirai import MoiraiForecast, MoiraiModule
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -111,9 +111,9 @@ class MoiraiForecasterAgent:
             return
 
         print(f"   [LOAD] Downloading/loading {MOIRAI_MODEL_ID}...")
-        module = Moirai2Module.from_pretrained(MOIRAI_MODEL_ID)
+        module = MoiraiModule.from_pretrained(MOIRAI_MODEL_ID)
 
-        self.model = Moirai2Forecast(
+        self.model = MoiraiForecast(
             module=module,
             prediction_length=FORECAST_HORIZON,
             context_length=CONTEXT_LENGTH,

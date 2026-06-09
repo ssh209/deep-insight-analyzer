@@ -98,3 +98,6 @@ class PipelineState(TypedDict):
     review_feedback: str
     is_approved: bool
     loop_count: int
+    
+    # 📄 최종 HTML 보고서
+    report_url: str                     # GCS 공개 URL 또는 로컬 파일 경로

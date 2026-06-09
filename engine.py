@@ -31,6 +31,7 @@ from agents.reporter.analyst import AnalystAgent
 from agents.reporter.strategist import StrategistAgent
 from agents.reporter.compiler import CompilerAgent
 from agents.reviewer import ReviewerAgent
+from report_generator import ReportPublisherAgent
 
 # 인프라 컴포넌트 초기화 함수
 async def init_infrastructure():
@@ -101,6 +102,7 @@ def build_graph(client, vector_db, embeddings=None, db_pool=None):
     strategist = StrategistAgent(client, STRATEGIST_MODEL, vector_db)
     compiler = CompilerAgent(client, COMPILER_MODEL)
     reviewer = ReviewerAgent(client, REVIEWER_MODEL, vector_db)
+    report_publisher = ReportPublisherAgent()
 
     logger.info(
         f"🤖 멀티모델 전략 적용 — "
@@ -126,6 +128,7 @@ def build_graph(client, vector_db, embeddings=None, db_pool=None):
     workflow.add_node("analyst", analyst.run)
     workflow.add_node("compiler", compiler.run)
     workflow.add_node("reviewer", reviewer.run)
+    workflow.add_node("report_publisher", report_publisher.run)
 
     # 3. 순차 엣지 연결
     if query_builder and retriever:
@@ -151,13 +154,14 @@ def build_graph(client, vector_db, embeddings=None, db_pool=None):
     workflow.add_edge("analyst", "compiler")
     workflow.add_edge("compiler", "reviewer")
 
-    # 4. 가이드라인 미통과 시 재기획 단계(planner)로 피드백 조건부 라우팅
+    # 4. 가이드라인 미통과 시 재기획, 승인 시 보고서 발행
     def should_continue(state: PipelineState):
         if state.get("is_approved") or state.get("loop_count", 0) >= 3:
-            return END
+            return "report_publisher"
         return "planner"
 
     workflow.add_conditional_edges("reviewer", should_continue)
+    workflow.add_edge("report_publisher", END)
 
     return workflow.compile()
 

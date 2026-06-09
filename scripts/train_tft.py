@@ -41,8 +41,9 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 # ==========================================
 # 설정
 # ==========================================
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-CHECKPOINT_NAME = "tft_nvi"
+from config import TFT_MODEL_PATH
+TFT_MODEL_DIR = os.path.dirname(TFT_MODEL_PATH)
+CHECKPOINT_NAME = os.path.splitext(os.path.basename(TFT_MODEL_PATH))[0]
 
 TARGET = "Actual_NVI"
 MAX_ENCODER_LENGTH = 72
@@ -180,12 +181,12 @@ def train(
     print(f"   encoder_length: {MAX_ENCODER_LENGTH}, prediction_length: {MAX_PREDICTION_LENGTH}")
 
     # 4. 학습
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(TFT_MODEL_DIR, exist_ok=True)
 
     callbacks = [
         EarlyStopping(monitor="val_loss", patience=5, mode="min"),
         ModelCheckpoint(
-            dirpath=MODEL_DIR,
+            dirpath=TFT_MODEL_DIR,
             filename=CHECKPOINT_NAME,
             monitor="val_loss",
             mode="min",
@@ -213,7 +214,7 @@ def train(
     if best_model_path:
         # 표준 경로로 복사
 
-        target_path = os.path.join(MODEL_DIR, "tft_nvi.ckpt")
+        target_path = TFT_MODEL_PATH
         shutil.copy2(best_model_path, target_path)
         print(f"\n[OK] Best model saved: {target_path}")
         print(f"   Val loss: {trainer.checkpoint_callback.best_model_score:.6f}")

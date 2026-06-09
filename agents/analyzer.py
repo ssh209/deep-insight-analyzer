@@ -17,6 +17,7 @@ AnalyzerAgent — 원본 텍스트(Posts/Comments) → 감성 분류 → 시계�
 """
 import os
 import json
+import uuid
 import asyncio
 import pandas as pd
 import numpy as np
@@ -24,7 +25,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from google.cloud import storage, aiplatform
+# google.cloud.storage, aiplatform → 배치 메서드에서 lazy import (시작 시간 최적화)
+from config import OUTPUT_DIR
 
 # ==========================================
 # 📊 감성 분석 Structured Output 스키마
@@ -40,6 +42,18 @@ class CommentAnalysis(BaseModel):
 
 class BatchAnalysisResult(BaseModel):
     results: list[CommentAnalysis]
+
+
+class DocAnalysis(BaseModel):
+    doc_id: int = Field(description="분석 대상 문서 ID")
+    tone: Literal["hostile", "critical", "neutral", "sympathetic", "supportive"] = Field(
+        description="원문의 기업/이슈에 대한 논조"
+    )
+    is_attack_content: bool = Field(description="저격 영상, 폭로 게시글 등 직접 공격형 콘텐츠 여부")
+    tone_score: float = Field(description="-1.0(극부정) ~ 1.0(극긍정)")
+
+class DocBatchAnalysisResult(BaseModel):
+    results: list[DocAnalysis]
 
 
 class ThemeCluster(BaseModel):
@@ -89,6 +103,30 @@ SENTIMENT_PROMPT_TEMPLATE = """아래 댓글들의 감성을 분류하세요.
 {comments_text}
 """
 
+# ==========================================
+# 📋 원문 톤 분류 시스템 프롬프트
+# ==========================================
+DOC_TONE_SYSTEM = (
+    "당신은 한국어 미디어 논조 분석 전문가입니다. "
+    "뉴스 기사, 블로그, 커뮤니티 게시글, SNS 포스트의 기업/이슈에 대한 논조를 분류합니다."
+)
+
+DOC_TONE_PROMPT_TEMPLATE = """아래 원문들의 논조를 분류하세요.
+
+[분류 기준]
+- tone: 기업/이슈에 대한 원문의 논조
+  hostile    = 적대적 공격 (유튜버 저격, 커뮤니티 마녀사냥, 악의적 폭로)
+  critical   = 비판적이지만 사실 기반 (언론 부정 보도, 문제 제기)
+  neutral    = 중립 보도/정보 전달 (단순 사실 전달, 무관한 언급)
+  sympathetic = 동정적/이해 표현 (피해자 시각, 상황 이해)
+  supportive = 적극 옹호/방어 (기업 방어, 긍정적 재평가)
+- is_attack_content: 저격 영상, 폭로 게시글 등 직접 공격형 콘텐츠 여부
+- tone_score: -1.0(극도로 적대적) ~ 1.0(극도로 옹호적) 연속값
+
+[원문 목록]
+{docs_text}
+"""
+
 
 class AnalyzerAgent:
     """
@@ -126,18 +164,31 @@ class AnalyzerAgent:
         print(f"\n>> [Analyzer] issue_id={issue_id} 분석 시작 "
               f"(docs {len(docs)}건, comments {len(comments)}건)...")
         
-        # 1. LLM 배치 감성 분류 + 3회 재시도
+        # 1. LLM 배치 감성 분류 + 3회 재시도 (댓글)
         if not comments:
             print("   [SKIP] 분석 대상 댓글 없음")
             analysis_results = []
         else:
             analysis_results, failed = await self._analyze_with_retry(comments)
-            print(f"   [DONE] 분석 성공 {len(analysis_results)}건, 최종 실패 {failed}건")
+            print(f"   [DONE] 댓글 감성 분석 성공 {len(analysis_results)}건, 최종 실패 {failed}건")
+        
+        # 1b. 원문 톤 분류 (Doc Tone Analysis)
+        if not docs:
+            print("   [SKIP] 분석 대상 원문 없음")
+            doc_analysis_results = []
+        else:
+            doc_analysis_results, doc_failed = await self._analyze_docs(docs)
+            print(f"   [DONE] 원문 톤 분석 성공 {len(doc_analysis_results)}건, 최종 실패 {doc_failed}건")
         
         # 2. 분석 결과 DB 저장 (analysis_results INSERT)
         if analysis_results and self.pool:
             saved = await self._save_analysis_results(analysis_results, issue_id)
             print(f"   [DB] 감성 분석 결과 {saved}건 INSERT")
+        
+        # 2b. 원문 톤 분석 결과 DB 저장
+        if doc_analysis_results and self.pool:
+            saved = await self._save_doc_tone_results(doc_analysis_results, issue_id)
+            print(f"   [DB] 원문 톤 분석 결과 {saved}건 INSERT")
         
         # 3. Docs 영향력 스코어링 (규칙 기반, 메모리)
         doc_scores = self._score_docs(docs)
@@ -148,8 +199,11 @@ class AnalyzerAgent:
             saved = await self._save_doc_scores(doc_scores, issue_id)
             print(f"   [DB] Doc 영향력 스코어 {saved}건 INSERT")
         
-        # 5. 집계 → CSV 내보내기
-        csv_path = self._export_csv(comments, analysis_results, doc_scores, issue_id)
+        # 5. 집계 → CSV 내보내기 (원문 톤 포함)
+        csv_path = self._export_csv(
+            comments, analysis_results, doc_scores, issue_id,
+            docs=docs, doc_analysis_results=doc_analysis_results,
+        )
         print(f"   [EXPORT] CSV: {csv_path}")
         
         # 6. 여론 지형도 (Sentiment Landscape) 생성
@@ -245,8 +299,9 @@ class AnalyzerAgent:
     # ==========================================
     async def _save_analysis_results(self, analysis_results: list[dict], issue_id: str) -> int:
         """LLM 감성 분석 결과를 analysis_results 테이블에 INSERT."""
+        uid = uuid.UUID(issue_id)
         rows = [
-            (issue_id, int(a["comment_id"]), a["sentiment"],
+            (uid, int(a["comment_id"]), a["sentiment"],
              a["sentiment_score"], a["is_mockery"], a["is_advocate"],
              self.model_name)
             for a in analysis_results
@@ -290,8 +345,9 @@ class AnalyzerAgent:
     # ==========================================
     async def _save_doc_scores(self, doc_scores: dict[int, int], issue_id: str) -> int:
         """규칙 기반 영향력 스코어를 analysis_results 테이블에 INSERT."""
+        uid = uuid.UUID(issue_id)
         rows = [
-            (issue_id, doc_id, score, 'rule-based')
+            (uid, doc_id, score, 'rule-based')
             for doc_id, score in doc_scores.items()
         ]
         async with self.pool.acquire() as conn:
@@ -304,6 +360,93 @@ class AnalyzerAgent:
         return len(rows)
     
     # ==========================================
+    # Step 1c. 원문 톤 분류 (Doc Tone Analysis)
+    # ==========================================
+    DOC_BATCH_SIZE = 10  # 원문은 길어서 배치 크기 축소
+
+    async def _analyze_docs(self, docs: list[dict]) -> tuple[list[dict], int]:
+        """원문 톤 분류. title + snippet으로 논조를 판별.
+        
+        Returns: (분석 결과 리스트, 실패 건수)
+        """
+        batches = [
+            docs[i:i + self.DOC_BATCH_SIZE]
+            for i in range(0, len(docs), self.DOC_BATCH_SIZE)
+        ]
+
+        all_results = []
+        pending = batches
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            if not pending:
+                break
+
+            failed_batches = []
+
+            for chunk_start in range(0, len(pending), self.CONCURRENT):
+                chunk = pending[chunk_start:chunk_start + self.CONCURRENT]
+                tasks = [self._call_doc_tone_llm(batch) for batch in chunk]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        print(f"   [DOC-RETRY {attempt}/{self.MAX_RETRIES}] "
+                              f"배치 {len(chunk[i])}건 실패: {result}")
+                        failed_batches.append(chunk[i])
+                    else:
+                        all_results.extend(result)
+
+            pending = failed_batches
+            if pending and attempt < self.MAX_RETRIES:
+                await asyncio.sleep(2 ** attempt)
+
+        total_failed = sum(len(b) for b in pending)
+        return all_results, total_failed
+
+    async def _call_doc_tone_llm(self, batch: list[dict]) -> list[dict]:
+        """원문 배치 LLM 호출. title + snippet (최대 200자)로 톤 분류."""
+        docs_text = "\n".join(
+            f"[{d['doc_id']}] [{d.get('channel', '')}] {d.get('title', '')} — {(d.get('snippet', '') or '')[:200]}"
+            for d in batch
+        )
+        prompt = DOC_TONE_PROMPT_TEMPLATE.format(docs_text=docs_text)
+
+        response = await asyncio.to_thread(
+            self.client.models.generate_content,
+            model=self.model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=DOC_TONE_SYSTEM,
+                response_mime_type="application/json",
+                response_schema=DocBatchAnalysisResult,
+                temperature=0.1,
+            )
+        )
+
+        result = json.loads(response.text)
+        return result["results"]
+
+    async def _save_doc_tone_results(self, doc_analysis_results: list[dict], issue_id: str) -> int:
+        """원문 톤 분석 결과를 analysis_results 테이블에 INSERT."""
+        uid = uuid.UUID(issue_id)
+        rows = [
+            (uid, int(a["doc_id"]), a["tone"],
+             a["tone_score"], a["is_attack_content"],
+             self.model_name)
+            for a in doc_analysis_results
+        ]
+        async with self.pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO deep_insight.analysis_results
+                    (issue_id, target_type, target_id,
+                     sentiment, sentiment_score, is_attack_content,
+                     model_version)
+                VALUES ($1, 'doc_tone', $2, $3, $4, $5, $6)
+                ON CONFLICT (issue_id, target_type, target_id, model_version) DO NOTHING
+            """, rows)
+        return len(rows)
+
+    # ==========================================
     # Step 3. 분석 결과 집계 → CSV 내보내기
     # ==========================================
     def _export_csv(
@@ -312,17 +455,27 @@ class AnalyzerAgent:
         analysis_results: list[dict],
         doc_scores: dict[int, int],
         issue_id: str,
+        docs: list[dict] = None,
+        doc_analysis_results: list[dict] = None,
     ) -> str:
-        """메모리 데이터로 시간당 집계 → ForecasterAgent 입력 CSV 생성."""
-        # 댓글 데이터가 없으면 빈 csv 파일 생성
-        if not comments:
-            os.makedirs("data", exist_ok=True)
-            csv_path = f"data/analyzed_{issue_id}.csv"
+        """메모리 데이터로 시간당 집계 → ForecasterAgent 입력 CSV 생성.
+        
+        댓글 감성 + 원문 톤을 모두 집계하여 확장 피처 CSV를 생성합니다.
+        """
+        docs = docs or []
+        doc_analysis_results = doc_analysis_results or []
+        
+        # 댓글+원문 모두 없으면 빈 csv 파일 생성
+        if not comments and not docs:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            csv_path = os.path.join(OUTPUT_DIR, f"analyzed_{issue_id}.csv")
             pd.DataFrame(columns=[
                 "Datetime", "Hours_Since_Start", "Company_Action_Type",
                 "Influencer_Impact", "Raw_Total_Mentions",
                 "Negative_Ratio", "Mockery_Index", "Advocate_Ratio",
-                "Negative_Momentum", "Actual_NVI"
+                "Negative_Momentum",
+                "Doc_Hostile_Ratio", "Doc_Supportive_Ratio", "Narrative_Pressure",
+                "Actual_NVI"
             ]).to_csv(csv_path, index=False)
             return csv_path
         
@@ -409,22 +562,84 @@ class AnalyzerAgent:
         )
         
         hourly["Company_Action_Type"] = 0
+
+        # --- 원문 톤 집계 ---
+        doc_tone_map = {}
+        for da in doc_analysis_results:
+            doc_tone_map[da["doc_id"]] = da
+        
+        if docs:
+            doc_df = pd.DataFrame(docs)
+            doc_df["published_at"] = pd.to_datetime(
+                doc_df["published_at"], utc=True, errors="coerce"
+            )
+            doc_df["hour_bucket"] = doc_df["published_at"].dt.floor("h")
+            
+            # 톤 매핑
+            doc_df["tone"] = doc_df["doc_id"].map(
+                lambda did: doc_tone_map.get(did, {}).get("tone")
+            )
+            
+            tone_analyzed = doc_df[doc_df["tone"].notna()]
+            
+            if not tone_analyzed.empty:
+                hourly_doc = tone_analyzed.groupby("hour_bucket").agg(
+                    doc_total=("doc_id", "count"),
+                    hostile_count=("tone", lambda x: ((x == "hostile") | (x == "critical")).sum()),
+                    supportive_count=("tone", lambda x: ((x == "sympathetic") | (x == "supportive")).sum()),
+                    hostile_only=("tone", lambda x: (x == "hostile").sum()),
+                    critical_only=("tone", lambda x: (x == "critical").sum()),
+                    sympathetic_only=("tone", lambda x: (x == "sympathetic").sum()),
+                    supportive_only=("tone", lambda x: (x == "supportive").sum()),
+                ).reset_index()
+                
+                hourly = hourly.merge(hourly_doc, on="hour_bucket", how="left")
+            else:
+                for col in ["doc_total", "hostile_count", "supportive_count",
+                            "hostile_only", "critical_only", "sympathetic_only", "supportive_only"]:
+                    hourly[col] = 0
+        else:
+            for col in ["doc_total", "hostile_count", "supportive_count",
+                        "hostile_only", "critical_only", "sympathetic_only", "supportive_only"]:
+                hourly[col] = 0
+        
+        hourly = hourly.fillna(0)
+        doc_cnt = hourly["doc_total"].astype(float).replace(0, np.nan)
+        hourly["Doc_Hostile_Ratio"] = (
+            hourly["hostile_count"].astype(float) / doc_cnt
+        ).fillna(0).round(3)
+        hourly["Doc_Supportive_Ratio"] = (
+            hourly["supportive_count"].astype(float) / doc_cnt
+        ).fillna(0).round(3)
+        
+        # Narrative Pressure = hostile×0.12 + critical×0.05 - sympathetic×0.08 - supportive×0.10
+        hostile_r = (hourly["hostile_only"].astype(float) / doc_cnt).fillna(0)
+        critical_r = (hourly["critical_only"].astype(float) / doc_cnt).fillna(0)
+        sympathetic_r = (hourly["sympathetic_only"].astype(float) / doc_cnt).fillna(0)
+        supportive_r = (hourly["supportive_only"].astype(float) / doc_cnt).fillna(0)
+        hourly["Narrative_Pressure"] = (
+            hostile_r * 0.12 + critical_r * 0.05
+            - sympathetic_r * 0.08 - supportive_r * 0.10
+        ).round(4)
+
         hourly["Actual_NVI"] = self._compute_nvi(hourly)
         
         output_cols = [
             "Datetime", "Hours_Since_Start", "Company_Action_Type",
             "Influencer_Impact", "Raw_Total_Mentions",
             "Negative_Ratio", "Mockery_Index", "Advocate_Ratio",
-            "Negative_Momentum", "Actual_NVI"
+            "Negative_Momentum",
+            "Doc_Hostile_Ratio", "Doc_Supportive_Ratio", "Narrative_Pressure",
+            "Actual_NVI"
         ]
         
-        os.makedirs("data", exist_ok=True)
-        csv_path = f"data/analyzed_{issue_id}.csv"
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        csv_path = os.path.join(OUTPUT_DIR, f"analyzed_{issue_id}.csv")
         hourly[output_cols].to_csv(csv_path, index=False)
         return csv_path
     
     def _compute_nvi(self, df: pd.DataFrame) -> pd.Series:
-        """감성 지표 기반 NVI(Net Valence Index) 산출."""
+        """감성 지표 + 원문 톤 기반 NVI(Net Valence Index) 산출."""
         nvi = 0.5  # 초기 평형점
         nvi_values = []
         
@@ -432,13 +647,20 @@ class AnalyzerAgent:
             neg = float(row.get("Negative_Ratio", 0))
             mock = float(row.get("Mockery_Index", 0))
             adv = float(row.get("Advocate_Ratio", 0))
+            doc_hostile = float(row.get("Doc_Hostile_Ratio", 0))
+            doc_supportive = float(row.get("Doc_Supportive_Ratio", 0))
             
-            # 시간당 변화량
+            # 시간당 변화량 — 댓글 감성
             penalty = neg * 0.3 + mock * 0.2
             bonus = adv * 0.25
+            
+            # 시간당 변화량 — 원문 톤 (Narrative Pressure)
+            narrative_penalty = doc_hostile * 0.04
+            narrative_bonus = doc_supportive * 0.03
+            
             reversion = (0.5 - nvi) * 0.01  # 평형 회귀
             
-            nvi = nvi - penalty + bonus + reversion
+            nvi = nvi - penalty + bonus - narrative_penalty + narrative_bonus + reversion
             nvi = max(0.1, min(1.0, nvi))
             nvi_values.append(round(nvi, 3))
         
@@ -777,7 +999,8 @@ class BatchAnalyzer:
         # 1. JSONL 생성
         lines = self._build_jsonl(comments)
         
-        # 2. GCS 업로드
+        # 2. GCS 업로드 (lazy import — 배치 실행 시에만 로딩)
+        from google.cloud import storage
         storage_client = storage.Client(project=self.project_id)
         bucket = storage_client.bucket(self.gcs_bucket)
         input_path = f"batch_input/{issue_id}/input.jsonl"
@@ -788,6 +1011,7 @@ class BatchAnalyzer:
         gcs_output = f"gs://{self.gcs_bucket}/batch_output/{issue_id}/"
         
         # 3. Batch Job 제출
+        from google.cloud import aiplatform
         aiplatform.init(project=self.project_id, location=self.location)
         
         job = aiplatform.BatchPredictionJob.create(
@@ -866,6 +1090,7 @@ class BatchAnalyzer:
         """GCS 결과 JSONL 파싱 → analysis_results INSERT."""
 
         
+        from google.cloud import storage
         storage_client = storage.Client(project=self.project_id)
         bucket_name = gcs_output.split("/")[2]
         prefix = "/".join(gcs_output.split("/")[3:])

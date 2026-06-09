@@ -15,13 +15,17 @@ import joblib
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
-TRAIN_CSV = "data/pr_crisis_dataset.csv"
-MODEL_DIR = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "nvi_forecaster.pkl")
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import TRAIN_CSV_PATH, LGBM_MODEL_PATH
+
+TRAIN_CSV = TRAIN_CSV_PATH
+MODEL_PATH = LGBM_MODEL_PATH
 
 FEATURES = [
     'Hours_Since_Start', 'Company_Action_Type', 'Influencer_Impact',
-    'Negative_Ratio', 'Mockery_Index', 'Advocate_Ratio', 'Negative_Momentum'
+    'Negative_Ratio', 'Mockery_Index', 'Advocate_Ratio', 'Negative_Momentum',
+    'Doc_Hostile_Ratio', 'Doc_Supportive_Ratio', 'Narrative_Pressure',
 ]
 
 def train_and_save():
@@ -50,7 +54,7 @@ def train_and_save():
     model.fit(X_train, y_train)
     
     # 모델 저장
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     joblib.dump({"model": model, "features": FEATURES}, MODEL_PATH)
     
     print(f"\n[OK] Model saved: {MODEL_PATH}")

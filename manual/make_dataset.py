@@ -13,6 +13,10 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
       ③ 확산/바닥 (D5~D10) → 밈화, 해명문 역효과
       ④ 교착기 (D10~D18)  → CEO 사과, 관심 하락
       ⑤ 수습기 (D18~D30)  → 보상/감사, 옹호자 증가
+
+    피처:
+      - 댓글 감성: Negative_Ratio, Mockery_Index, Advocate_Ratio
+      - 원문 톤:   Doc_Hostile_Ratio, Doc_Supportive_Ratio, Narrative_Pressure
     """
     print("⏳ PR 위기 시뮬레이션 데이터셋(720h/30일) 생성 중...")
     
@@ -62,6 +66,12 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
     mockery_mentions = []
     advocate_mentions = []
     
+    # --- 원문 톤 시뮬레이션 ---
+    doc_hostile_list = []
+    doc_critical_list = []
+    doc_sympathetic_list = []
+    doc_supportive_list = []
+    
     current_total = 100
     
     for i in range(hours):
@@ -95,7 +105,7 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
         
         total_mentions.append(current_total)
         
-        # --- 감성 분할 (페이즈별 비율) ---
+        # --- 댓글 감성 분할 (페이즈별 비율) ---
         if i < 48:          # ① 잠복기
             neg_ratio = np.random.uniform(0.40, 0.55)
             mock_of_neg = np.random.uniform(0.10, 0.20)
@@ -129,6 +139,60 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
         negative_mentions.append(int(current_total * neg_ratio))
         mockery_mentions.append(int(current_total * neg_ratio * mock_of_neg))
         advocate_mentions.append(int(current_total * adv_ratio))
+
+        # --- 원문 톤 분할 (페이즈별) ---
+        # hostile: 저격/폭로/마녀사냥  |  critical: 비판적 보도/팩트 기반 부정
+        # sympathetic: 동정/이해 표현  |  supportive: 적극 옹호/방어
+        if i < 48:          # ① 잠복기: 아직 비판 기사 위주, 적대적 콘텐츠 소수
+            hostile_r = np.random.uniform(0.05, 0.15)
+            critical_r = np.random.uniform(0.20, 0.35)
+            sympathetic_r = np.random.uniform(0.05, 0.10)
+            supportive_r = np.random.uniform(0.02, 0.05)
+        elif i < 120:       # ② 폭발기: 저격 영상/폭로 급증, 비판 보도 쏟아짐
+            hostile_r = np.random.uniform(0.25, 0.45)
+            critical_r = np.random.uniform(0.30, 0.45)
+            sympathetic_r = np.random.uniform(0.02, 0.05)
+            supportive_r = np.random.uniform(0.01, 0.02)
+        elif i < 240:       # ③ 확산/바닥: hostile 최고점 유지, 밈화 극대화
+            hostile_r = np.random.uniform(0.30, 0.50)
+            critical_r = np.random.uniform(0.25, 0.35)
+            sympathetic_r = np.random.uniform(0.03, 0.08)
+            supportive_r = np.random.uniform(0.01, 0.03)
+        elif i < 432:       # ④ 교착기: CEO 사과 이후 hostile 감소, sympathetic 증가
+            progress = (i - 240) / (432 - 240)
+            hostile_r = np.random.uniform(
+                max(0.05, 0.25 - progress * 0.18),
+                max(0.10, 0.35 - progress * 0.18)
+            )
+            critical_r = np.random.uniform(
+                max(0.08, 0.25 - progress * 0.12),
+                max(0.12, 0.30 - progress * 0.10)
+            )
+            sympathetic_r = np.random.uniform(
+                0.08 + progress * 0.12,
+                0.15 + progress * 0.12
+            )
+            supportive_r = np.random.uniform(
+                0.05 + progress * 0.12,
+                0.12 + progress * 0.12
+            )
+        else:               # ⑤ 수습기: 옹호 콘텐츠 우세, hostile 최소화
+            progress = (i - 432) / (720 - 432)
+            hostile_r = np.random.uniform(0.02, max(0.05, 0.10 - progress * 0.06))
+            critical_r = np.random.uniform(0.05, max(0.08, 0.15 - progress * 0.08))
+            sympathetic_r = np.random.uniform(0.15 + progress * 0.05, 0.25 + progress * 0.05)
+            supportive_r = np.random.uniform(0.20 + progress * 0.10, 0.30 + progress * 0.10)
+        
+        # 클리핑 (각 비율은 0~1)
+        hostile_r = np.clip(hostile_r, 0.0, 0.60)
+        critical_r = np.clip(critical_r, 0.0, 0.60)
+        sympathetic_r = np.clip(sympathetic_r, 0.0, 0.50)
+        supportive_r = np.clip(supportive_r, 0.0, 0.50)
+        
+        doc_hostile_list.append(round(hostile_r, 3))
+        doc_critical_list.append(round(critical_r, 3))
+        doc_sympathetic_list.append(round(sympathetic_r, 3))
+        doc_supportive_list.append(round(supportive_r, 3))
     
     df['Raw_Total_Mentions'] = total_mentions
     df['Raw_Negative_Mentions'] = negative_mentions
@@ -136,7 +200,7 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
     df['Raw_Advocate_Mentions'] = advocate_mentions
 
     # ==========================================
-    # 🧠 Feature Engineering
+    # 🧠 Feature Engineering — 댓글 감성
     # ==========================================
     df['Negative_Ratio'] = (df['Raw_Negative_Mentions'] / df['Raw_Total_Mentions']).round(3)
     df['Mockery_Index'] = (df['Raw_Mockery_Mentions'] / df['Raw_Total_Mentions']).round(3)
@@ -144,6 +208,20 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
     
     df['SNS_Mentions_Velocity'] = df['Raw_Total_Mentions'].diff().fillna(0).astype(int)
     df['Negative_Momentum'] = df['Raw_Negative_Mentions'].diff().fillna(0).astype(int)
+
+    # ==========================================
+    # 🧠 Feature Engineering — 원문 톤 (Narrative Pressure)
+    # ==========================================
+    df['Doc_Hostile_Ratio'] = doc_hostile_list
+    df['Doc_Supportive_Ratio'] = doc_supportive_list
+    
+    # Narrative Pressure = hostile×0.12 + critical×0.05 - sympathetic×0.08 - supportive×0.10
+    df['Narrative_Pressure'] = (
+        np.array(doc_hostile_list) * 0.12
+        + np.array(doc_critical_list) * 0.05
+        - np.array(doc_sympathetic_list) * 0.08
+        - np.array(doc_supportive_list) * 0.10
+    ).round(4)
 
     # ==========================================
     # 🎯 NVI (Target Variable) 산출
@@ -157,22 +235,31 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
         adv_r = df.loc[i, 'Advocate_Ratio']
         momentum = df.loc[i, 'Negative_Momentum']
         action = df.loc[i, 'Company_Action_Type']
+        doc_hostile_r = df.loc[i, 'Doc_Hostile_Ratio']
+        doc_supportive_r = df.loc[i, 'Doc_Supportive_Ratio']
         
-        # 감점 요인 (시간당 누적이므로 가중치를 낮춤)
+        # 감점 요인 (댓글 기반)
         penalty = (neg_r * 0.03) + \
                   (mock_r * 0.04) + \
                   (0.05 if momentum > 2000 else 0)
                   
-        # 가점 요인
+        # 가점 요인 (댓글 기반)
         bonus = (adv_r * 0.06) + \
                 (0.01 if action == 1 else 0) + \
                 (0.04 if action == 2 else 0)
+
+        # 원문 톤 기여 (Narrative Pressure)
+        narrative_penalty = doc_hostile_r * 0.04
+        narrative_bonus = doc_supportive_r * 0.03
         
-        # 자연 회귀력: NVI가 극단(0.1 or 1.0)에서 멀수록 변동 작음,
-        # 가까울수록 반대 방향으로 약한 복원력 발생 (평형점 0.5)
+        # 자연 회귀력
         reversion = (0.5 - prev_nvi) * 0.002
         
-        new_nvi = prev_nvi - penalty + bonus + reversion + np.random.uniform(-0.005, 0.005)
+        new_nvi = (prev_nvi
+                   - penalty + bonus
+                   - narrative_penalty + narrative_bonus
+                   + reversion
+                   + np.random.uniform(-0.005, 0.005))
         new_nvi = np.clip(new_nvi, 0.1, 1.0)
         nvi_list.append(round(new_nvi, 3))
         
@@ -188,7 +275,8 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
         'Company_Action_Type', 'Influencer_Impact',
         'Raw_Total_Mentions', 'Raw_Negative_Mentions', 'Raw_Mockery_Mentions', 'Raw_Advocate_Mentions',
         'Negative_Ratio', 'Mockery_Index', 'Advocate_Ratio', 
-        'SNS_Mentions_Velocity', 'Negative_Momentum', 
+        'SNS_Mentions_Velocity', 'Negative_Momentum',
+        'Doc_Hostile_Ratio', 'Doc_Supportive_Ratio', 'Narrative_Pressure',
         'Actual_NVI'
     ]
     df = df[final_cols]
@@ -197,10 +285,15 @@ def create_synthetic_dataset(output_path="data/pr_crisis_dataset.csv"):
     print(f"✅ 데이터셋 생성 완료! ({hours}시간/{hours//24}일)")
     print(f"   저장 위치: {output_path}")
     print(f"   NVI 범위: {df['Actual_NVI'].min():.3f} ~ {df['Actual_NVI'].max():.3f}")
-    print(f"\n📊 페이즈별 NVI 평균:")
+    print(f"   Narrative Pressure 범위: {df['Narrative_Pressure'].min():.4f} ~ {df['Narrative_Pressure'].max():.4f}")
+    print(f"\n📊 페이즈별 NVI / Narrative Pressure 평균:")
     for label, s, e in [("① 잠복기", 0,48), ("② 폭발기", 48,120), ("③ 확산/바닥", 120,240), ("④ 교착기", 240,432), ("⑤ 수습기", 432,720)]:
         subset = df[(df['Hours_Since_Start'] >= s) & (df['Hours_Since_Start'] < e)]
-        print(f"   {label} (H{s}~H{e}): NVI avg={subset['Actual_NVI'].mean():.3f}, min={subset['Actual_NVI'].min():.3f}")
+        print(f"   {label} (H{s}~H{e}): NVI avg={subset['Actual_NVI'].mean():.3f}, "
+              f"NP avg={subset['Narrative_Pressure'].mean():.4f}, "
+              f"Doc_Hostile={subset['Doc_Hostile_Ratio'].mean():.3f}, "
+              f"Doc_Supportive={subset['Doc_Supportive_Ratio'].mean():.3f}")
+
 def create_input_dataset(output_path="data/input_crisis_72h.csv"):
     """
     72시간 실전 입력 데이터셋 생성.
@@ -231,6 +324,10 @@ def create_input_dataset(output_path="data/input_crisis_72h.csv"):
     negative_mentions = []
     mockery_mentions = []
     advocate_mentions = []
+    doc_hostile_list = []
+    doc_critical_list = []
+    doc_sympathetic_list = []
+    doc_supportive_list = []
     
     current_total = 100
     for i in range(hours):
@@ -253,7 +350,7 @@ def create_input_dataset(output_path="data/input_crisis_72h.csv"):
         
         total_mentions.append(current_total)
         
-        # 감성 비율
+        # 댓글 감성 비율
         if i < 24:       # 잠복기 초반
             neg_ratio = np.random.uniform(0.35, 0.50)
             mock_of_neg = np.random.uniform(0.10, 0.20)
@@ -273,18 +370,55 @@ def create_input_dataset(output_path="data/input_crisis_72h.csv"):
         negative_mentions.append(int(current_total * neg_ratio))
         mockery_mentions.append(int(current_total * neg_ratio * mock_of_neg))
         advocate_mentions.append(int(current_total * adv_ratio))
+
+        # 원문 톤 비율
+        if i < 24:       # 잠복기 초반
+            hostile_r = np.random.uniform(0.05, 0.15)
+            critical_r = np.random.uniform(0.20, 0.35)
+            sympathetic_r = np.random.uniform(0.05, 0.10)
+            supportive_r = np.random.uniform(0.02, 0.05)
+        elif i < 48:     # 잠복기 후반
+            hostile_r = np.random.uniform(0.15, 0.30)
+            critical_r = np.random.uniform(0.25, 0.40)
+            sympathetic_r = np.random.uniform(0.03, 0.08)
+            supportive_r = np.random.uniform(0.02, 0.04)
+        else:            # 폭발기
+            hostile_r = np.random.uniform(0.30, 0.50)
+            critical_r = np.random.uniform(0.30, 0.45)
+            sympathetic_r = np.random.uniform(0.02, 0.05)
+            supportive_r = np.random.uniform(0.01, 0.02)
+        
+        hostile_r = np.clip(hostile_r, 0.0, 0.60)
+        critical_r = np.clip(critical_r, 0.0, 0.60)
+        sympathetic_r = np.clip(sympathetic_r, 0.0, 0.50)
+        supportive_r = np.clip(supportive_r, 0.0, 0.50)
+        
+        doc_hostile_list.append(round(hostile_r, 3))
+        doc_critical_list.append(round(critical_r, 3))
+        doc_sympathetic_list.append(round(sympathetic_r, 3))
+        doc_supportive_list.append(round(supportive_r, 3))
     
     df['Raw_Total_Mentions'] = total_mentions
     df['Raw_Negative_Mentions'] = negative_mentions
     df['Raw_Mockery_Mentions'] = mockery_mentions
     df['Raw_Advocate_Mentions'] = advocate_mentions
     
-    # Feature Engineering
+    # Feature Engineering — 댓글 감성
     df['Negative_Ratio'] = (df['Raw_Negative_Mentions'] / df['Raw_Total_Mentions']).round(3)
     df['Mockery_Index'] = (df['Raw_Mockery_Mentions'] / df['Raw_Total_Mentions']).round(3)
     df['Advocate_Ratio'] = (df['Raw_Advocate_Mentions'] / df['Raw_Total_Mentions']).round(3)
     df['SNS_Mentions_Velocity'] = df['Raw_Total_Mentions'].diff().fillna(0).astype(int)
     df['Negative_Momentum'] = df['Raw_Negative_Mentions'].diff().fillna(0).astype(int)
+
+    # Feature Engineering — 원문 톤
+    df['Doc_Hostile_Ratio'] = doc_hostile_list
+    df['Doc_Supportive_Ratio'] = doc_supportive_list
+    df['Narrative_Pressure'] = (
+        np.array(doc_hostile_list) * 0.12
+        + np.array(doc_critical_list) * 0.05
+        - np.array(doc_sympathetic_list) * 0.08
+        - np.array(doc_supportive_list) * 0.10
+    ).round(4)
     
     # NVI 산출
     nvi_list = [1.0]
@@ -295,12 +429,20 @@ def create_input_dataset(output_path="data/input_crisis_72h.csv"):
         adv_r = df.loc[i, 'Advocate_Ratio']
         momentum = df.loc[i, 'Negative_Momentum']
         action = df.loc[i, 'Company_Action_Type']
+        doc_hostile_r = df.loc[i, 'Doc_Hostile_Ratio']
+        doc_supportive_r = df.loc[i, 'Doc_Supportive_Ratio']
         
         penalty = (neg_r * 0.03) + (mock_r * 0.04) + (0.05 if momentum > 2000 else 0)
         bonus = (adv_r * 0.06) + (0.01 if action == 1 else 0) + (0.04 if action == 2 else 0)
+        narrative_penalty = doc_hostile_r * 0.04
+        narrative_bonus = doc_supportive_r * 0.03
         reversion = (0.5 - prev_nvi) * 0.002
         
-        new_nvi = prev_nvi - penalty + bonus + reversion + np.random.uniform(-0.005, 0.005)
+        new_nvi = (prev_nvi
+                   - penalty + bonus
+                   - narrative_penalty + narrative_bonus
+                   + reversion
+                   + np.random.uniform(-0.005, 0.005))
         new_nvi = np.clip(new_nvi, 0.1, 1.0)
         nvi_list.append(round(new_nvi, 3))
     
@@ -312,6 +454,7 @@ def create_input_dataset(output_path="data/input_crisis_72h.csv"):
         'Raw_Total_Mentions', 'Raw_Negative_Mentions', 'Raw_Mockery_Mentions', 'Raw_Advocate_Mentions',
         'Negative_Ratio', 'Mockery_Index', 'Advocate_Ratio',
         'SNS_Mentions_Velocity', 'Negative_Momentum',
+        'Doc_Hostile_Ratio', 'Doc_Supportive_Ratio', 'Narrative_Pressure',
         'Actual_NVI'
     ]
     df = df[final_cols]
@@ -320,6 +463,7 @@ def create_input_dataset(output_path="data/input_crisis_72h.csv"):
     df.to_csv(output_path, index=False)
     print(f"[OK] 72h input data saved: {output_path}")
     print(f"   NVI: {df['Actual_NVI'].iloc[0]:.3f} -> {df['Actual_NVI'].iloc[-1]:.3f} (last)")
+    print(f"   Narrative Pressure: {df['Narrative_Pressure'].min():.4f} ~ {df['Narrative_Pressure'].max():.4f}")
 
 if __name__ == "__main__":
     create_synthetic_dataset()       # 720h 학습 데이터
