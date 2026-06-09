@@ -1,55 +1,50 @@
 -- ==========================================
--- Issue Cracker — Schema DDL (간소화 버전)
+-- Deep Insight Analyzer — Schema DDL
 -- PostgreSQL 16+ / pgvector 확장 필요
 --
--- 테이블 구성 (5개):
---   1. issues             — 사용자 입력 단위 (분석 요청)
---   2. posts              — 원문 (전체 수집, issue 독립)
---   3. comments           — 댓글 (전체 수집, issue 독립)
---   4. analysis_results   — 감성 분류 결과 (issue 연결)
---   5. pipeline_runs      — 파이프라인 실행 이력 & 결과
---
 -- 설계 원칙:
---   - posts/comments는 이슈와 무관하게 전체 수집
---   - analysis_results만 issue_id로 연결 (어떤 이슈 관점의 분석인지)
---   - posts/comments에 pgvector 임베딩 → 이슈별 관련 콘텐츠 검색
+--   - Collector가 관리하는 수집 테이블(deep_insight.collected_doc 등)은 읽기 전용
+--   - Analyzer 전용 테이블만 deep_insight 스키마에 생성
+--   - issues 테이블이 분석 단위 — user_input + QueryBuilder 결과물 보관
+--   - analysis_results가 감성 분류 결과 (doc_id / comment_id FK 참조)
+--   - pipeline_runs가 파이프라인 실행 이력
+--
+-- Collector 테이블 참조 (읽기 전용, 여기서 DDL 생성 안 함):
+--   deep_insight.collected_doc          — 수집 문서 (doc_id BIGINT PK)
+--   deep_insight.collected_doc_comment  — YouTube 댓글 (comment_id BIGINT PK)
+--   deep_insight.collected_doc_embedding — 임베딩 벡터 (별도 테이블)
+--   deep_insight.collection_job         — 수집 작업 단위
 -- ==========================================
 
 -- 🗑️ DROP (역순)
-DROP TABLE IF EXISTS issue_cracker.pipeline_runs;
-DROP TABLE IF EXISTS issue_cracker.analysis_results;
-DROP TABLE IF EXISTS issue_cracker.comments;
-DROP TABLE IF EXISTS issue_cracker.posts;
-DROP TABLE IF EXISTS issue_cracker.issues;
+DROP TABLE IF EXISTS deep_insight.pipeline_runs;
+DROP TABLE IF EXISTS deep_insight.analysis_results;
+DROP TABLE IF EXISTS deep_insight.issues;
 
-DROP TYPE IF EXISTS issue_cracker.content_type;
-DROP TYPE IF EXISTS issue_cracker.platform_type;
-
-CREATE SCHEMA IF NOT EXISTS issue_cracker;
+CREATE SCHEMA IF NOT EXISTS deep_insight;
 CREATE EXTENSION IF NOT EXISTS vector;
-
--- ==========================================
--- 📦 ENUM Types
--- ==========================================
-CREATE TYPE issue_cracker.platform_type AS ENUM (
-    'youtube', 'twitter', 'community', 'news', 'instagram', 'tiktok'
-);
-
-CREATE TYPE issue_cracker.content_type AS ENUM (
-    'video', 'article', 'post', 'tweet', 'reel', 'short'
-);
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 
 -- ==========================================
--- [1] 🚨 Issues — 사용자 입력 단위
+-- [1] 🚨 Issues — 분석 요청 단위
+--
+--     user_input: 사용자가 입력한 위기 상황 설명
+--     QueryBuilder 결과물도 여기에 저장:
+--       search_keywords, search_queries, search_time_hint
 -- ==========================================
-CREATE TABLE issue_cracker.issues (
-    issue_id        TEXT        PRIMARY KEY,
-    user_input      TEXT        NOT NULL,               -- 사용자가 입력한 위기 상황 설명
+CREATE TABLE deep_insight.issues (
+    issue_id        UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_input      TEXT        NOT NULL,               -- 사용자 입력 위기 상황 설명
     issue_type      TEXT        NOT NULL                -- SCCT 위기 유형
                     CHECK (issue_type IN ('victim', 'accidental', 'preventable')),
     status          TEXT        NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'analyzing', 'resolved', 'archived')),
+
+    -- QueryBuilder 결과물 보관
+    search_keywords     JSONB   DEFAULT '[]',           -- 핵심 키워드 배열
+    search_queries      JSONB   DEFAULT '[]',           -- 벡터 검색 자연어 쿼리 배열
+    search_time_hint    TEXT,                            -- 검색 시간 범위 힌트
 
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -59,72 +54,19 @@ CREATE TABLE issue_cracker.issues (
 
 
 -- ==========================================
--- [2] 📄 Posts — 원문 (전체 수집, issue 독립)
+-- [2] 📊 Analysis Results — 감성 분류 + 영향력 스코어
+--
+--     target_type = 'doc' → collected_doc.doc_id 참조
+--     target_type = 'comment' → collected_doc_comment.comment_id 참조
+--
+--     같은 대상도 issue마다 다른 관점으로 분석 가능
 -- ==========================================
-CREATE TABLE issue_cracker.posts (
-    post_id         TEXT        PRIMARY KEY,
-    created_at      TIMESTAMPTZ NOT NULL,
-    collected_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    platform        issue_cracker.platform_type NOT NULL,
-    content_type    issue_cracker.content_type  NOT NULL,
-    url             TEXT,
-
-    title           TEXT        NOT NULL,
-    body            TEXT,
-
-    author_id       TEXT        NOT NULL,
-    author_name     TEXT,
-    author_followers INTEGER    DEFAULT 0,
-
-    view_count      INTEGER     DEFAULT 0,
-    like_count      INTEGER     DEFAULT 0,
-    share_count     INTEGER     DEFAULT 0,
-    comment_count   INTEGER     DEFAULT 0,
-
-    -- pgvector 임베딩 (title + body)
-    embedding       vector(384),                        -- all-MiniLM-L6-v2 차원
-
-    extra           JSONB       DEFAULT '{}'
-);
-
-
--- ==========================================
--- [3] 💬 Comments — 댓글 (전체 수집, issue 독립)
--- ==========================================
-CREATE TABLE issue_cracker.comments (
-    comment_id          TEXT        PRIMARY KEY,
-    post_id             TEXT        NOT NULL,
-    parent_comment_id   TEXT,
-    created_at          TIMESTAMPTZ NOT NULL,
-    collected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    body                TEXT        NOT NULL,
-
-    author_id           TEXT        NOT NULL,
-    author_name         TEXT,
-    author_followers    INTEGER,
-
-    like_count          INTEGER     DEFAULT 0,
-    reply_count         INTEGER     DEFAULT 0,
-
-    -- pgvector 임베딩 (body)
-    embedding           vector(384),                    -- all-MiniLM-L6-v2 차원
-
-    extra               JSONB       DEFAULT '{}'
-);
-
-
--- ==========================================
--- [4] 📊 Analysis Results — 감성 분류 + 영향력 스코어
---     issue_id 연결: 같은 댓글도 이슈마다 다른 관점으로 분석 가능
--- ==========================================
-CREATE TABLE issue_cracker.analysis_results (
+CREATE TABLE deep_insight.analysis_results (
     id              BIGSERIAL   PRIMARY KEY,
-    issue_id        TEXT        NOT NULL,
+    issue_id        UUID        NOT NULL REFERENCES deep_insight.issues (issue_id) ON DELETE CASCADE,
 
-    target_type     TEXT        NOT NULL CHECK (target_type IN ('post', 'comment')),
-    target_id       TEXT        NOT NULL,
+    target_type     TEXT        NOT NULL CHECK (target_type IN ('doc', 'comment')),
+    target_id       BIGINT      NOT NULL,               -- doc_id 또는 comment_id (BIGINT)
 
     -- 감성 분류
     sentiment       TEXT        CHECK (sentiment IN ('positive', 'negative', 'neutral')),
@@ -134,7 +76,7 @@ CREATE TABLE issue_cracker.analysis_results (
     is_mockery      BOOLEAN     DEFAULT FALSE,
     is_advocate     BOOLEAN     DEFAULT FALSE,
 
-    -- 포스트 특화
+    -- 문서 특화 (영향력 점수)
     influence_score SMALLINT,
 
     -- 메타
@@ -146,11 +88,11 @@ CREATE TABLE issue_cracker.analysis_results (
 
 
 -- ==========================================
--- [5] 🔄 Pipeline Runs — 파이프라인 실행 이력 & 결과
+-- [3] 🔄 Pipeline Runs — 파이프라인 실행 이력 & 결과
 -- ==========================================
-CREATE TABLE issue_cracker.pipeline_runs (
+CREATE TABLE deep_insight.pipeline_runs (
     run_id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    issue_id            TEXT        NOT NULL,
+    issue_id            UUID        NOT NULL REFERENCES deep_insight.issues (issue_id) ON DELETE CASCADE,
 
     -- 입력 파라미터
     issue_type          TEXT        NOT NULL,
@@ -193,41 +135,19 @@ CREATE TABLE issue_cracker.pipeline_runs (
 
 -- issues
 CREATE INDEX idx_issues_status
-    ON issue_cracker.issues (status, created_at DESC);
-
--- posts
-CREATE INDEX idx_posts_platform_time
-    ON issue_cracker.posts (platform, created_at DESC);
-CREATE INDEX idx_posts_collected
-    ON issue_cracker.posts (collected_at DESC);
-
--- posts: pgvector (코사인 유사도 검색)
-CREATE INDEX idx_posts_embedding
-    ON issue_cracker.posts
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-
--- comments
-CREATE INDEX idx_comments_post
-    ON issue_cracker.comments (post_id, created_at);
-CREATE INDEX idx_comments_collected
-    ON issue_cracker.comments (collected_at DESC);
-
--- comments: pgvector (코사인 유사도 검색)
-CREATE INDEX idx_comments_embedding
-    ON issue_cracker.comments
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+    ON deep_insight.issues (status, created_at DESC);
 
 -- analysis_results
 CREATE INDEX idx_analysis_issue_type
-    ON issue_cracker.analysis_results (issue_id, target_type);
+    ON deep_insight.analysis_results (issue_id, target_type);
 CREATE INDEX idx_analysis_sentiment
-    ON issue_cracker.analysis_results (issue_id, target_type, sentiment)
+    ON deep_insight.analysis_results (issue_id, target_type, sentiment)
     WHERE sentiment IS NOT NULL;
+CREATE INDEX idx_analysis_target
+    ON deep_insight.analysis_results (target_type, target_id);
 
 -- pipeline_runs
 CREATE INDEX idx_pipeline_runs_issue
-    ON issue_cracker.pipeline_runs (issue_id, started_at DESC);
+    ON deep_insight.pipeline_runs (issue_id, started_at DESC);
 CREATE INDEX idx_pipeline_runs_status
-    ON issue_cracker.pipeline_runs (status, started_at DESC);
+    ON deep_insight.pipeline_runs (status, started_at DESC);

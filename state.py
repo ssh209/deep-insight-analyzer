@@ -72,9 +72,9 @@ class PipelineState(TypedDict):
     key_opinion_leaders: list            # KOL 식별 결과 (author, platform, stance, influence)
     
     # 📊 Retriever 산출물 (메모리 전달 — DB SELECT는 Retriever에서만)
-    retrieved_post_ids: list            # pgVector 검색으로 확보된 post_id 목록
-    retrieved_posts: list               # 검색된 posts 전체 데이터 (dict 리스트)
-    retrieved_comments: list            # 검색된 posts의 모든 댓글 (dict 리스트)
+    retrieved_doc_ids: list             # pgVector 검색으로 확보된 doc_id 목록
+    retrieved_docs: list                # 검색된 docs 전체 데이터 (dict 리스트)
+    retrieved_comments: list            # 검색된 docs의 모든 댓글 (dict 리스트)
     retrieved_comment_count: int        # 검색된 댓글 수
     
     # 🎯 예측 결과의 이원화 (무대응 vs 전략 적용)

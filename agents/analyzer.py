@@ -120,11 +120,11 @@ class AnalyzerAgent:
     # ==========================================
     async def run(self, state: dict) -> dict:
         issue_id = state.get("issue_id", "unknown")
-        posts = state.get("retrieved_posts", [])
+        docs = state.get("retrieved_docs", [])
         comments = state.get("retrieved_comments", [])
         
         print(f"\n>> [Analyzer] issue_id={issue_id} 분석 시작 "
-              f"(posts {len(posts)}건, comments {len(comments)}건)...")
+              f"(docs {len(docs)}건, comments {len(comments)}건)...")
         
         # 1. LLM 배치 감성 분류 + 3회 재시도
         if not comments:
@@ -139,17 +139,17 @@ class AnalyzerAgent:
             saved = await self._save_analysis_results(analysis_results, issue_id)
             print(f"   [DB] 감성 분석 결과 {saved}건 INSERT")
         
-        # 3. Posts 영향력 스코어링 (규칙 기반, 메모리)
-        post_scores = self._score_posts(posts)
-        print(f"   [SCORE] Posts 영향력 스코어링: {len(post_scores)}건")
+        # 3. Docs 영향력 스코어링 (규칙 기반, 메모리)
+        doc_scores = self._score_docs(docs)
+        print(f"   [SCORE] Docs 영향력 스코어링: {len(doc_scores)}건")
         
-        # 4. Post 스코어 DB 저장
-        if post_scores and self.pool:
-            saved = await self._save_post_scores(post_scores, issue_id)
-            print(f"   [DB] Post 영향력 스코어 {saved}건 INSERT")
+        # 4. Doc 스코어 DB 저장
+        if doc_scores and self.pool:
+            saved = await self._save_doc_scores(doc_scores, issue_id)
+            print(f"   [DB] Doc 영향력 스코어 {saved}건 INSERT")
         
         # 5. 집계 → CSV 내보내기
-        csv_path = self._export_csv(comments, analysis_results, post_scores, issue_id)
+        csv_path = self._export_csv(comments, analysis_results, doc_scores, issue_id)
         print(f"   [EXPORT] CSV: {csv_path}")
         
         # 6. 여론 지형도 (Sentiment Landscape) 생성
@@ -160,12 +160,12 @@ class AnalyzerAgent:
         
         # 7. 감성 타임라인 (Sentiment Timeline) 생성
         timeline = self._build_sentiment_timeline(
-            comments, analysis_results, posts, post_scores
+            comments, analysis_results, docs, doc_scores
         )
         print(f"   [TIMELINE] 감성 타임라인 생성 완료")
         
         # 8. KOL (Key Opinion Leader) 식별
-        kols = await self._identify_kols(posts, post_scores)
+        kols = await self._identify_kols(docs, doc_scores)
         print(f"   [KOL] {len(kols)}명 식별 완료")
         
         return {
@@ -246,14 +246,14 @@ class AnalyzerAgent:
     async def _save_analysis_results(self, analysis_results: list[dict], issue_id: str) -> int:
         """LLM 감성 분석 결과를 analysis_results 테이블에 INSERT."""
         rows = [
-            (issue_id, a["comment_id"], a["sentiment"],
+            (issue_id, int(a["comment_id"]), a["sentiment"],
              a["sentiment_score"], a["is_mockery"], a["is_advocate"],
              self.model_name)
             for a in analysis_results
         ]
         async with self.pool.acquire() as conn:
             await conn.executemany("""
-                INSERT INTO issue_cracker.analysis_results
+                INSERT INTO deep_insight.analysis_results
                     (issue_id, target_type, target_id,
                      sentiment, sentiment_score, is_mockery, is_advocate,
                      model_version)
@@ -265,8 +265,8 @@ class AnalyzerAgent:
     # ==========================================
     # Step 2. Posts 영향력 스코어링 (규칙 기반, 메모리)
     # ==========================================
-    def _score_posts(self, posts: list[dict]) -> dict[str, int]:
-        """posts 리스트 → {post_id: influence_score} 매핑.
+    def _score_docs(self, docs: list[dict]) -> dict[int, int]:
+        """docs 리스트 → {doc_id: influence_score} 매핑.
         
         influence_score:
           2 = 메가 인플루언서 (followers >= 100K or views >= 500K)
@@ -274,31 +274,31 @@ class AnalyzerAgent:
           0 = 일반
         """
         scores = {}
-        for p in posts:
-            followers = p.get("author_followers", 0) or 0
-            views = p.get("view_count", 0) or 0
+        for d in docs:
+            followers = d.get("author_followers", 0) or 0
+            views = d.get("view_count", 0) or 0
             if followers >= 100000 or views >= 500000:
-                scores[p["post_id"]] = 2
+                scores[d["doc_id"]] = 2
             elif followers >= 10000 or views >= 50000:
-                scores[p["post_id"]] = 1
+                scores[d["doc_id"]] = 1
             else:
-                scores[p["post_id"]] = 0
+                scores[d["doc_id"]] = 0
         return scores
 
     # ==========================================
     # Step 2b. Post 영향력 스코어 DB 저장 (INSERT only)
     # ==========================================
-    async def _save_post_scores(self, post_scores: dict[str, int], issue_id: str) -> int:
+    async def _save_doc_scores(self, doc_scores: dict[int, int], issue_id: str) -> int:
         """규칙 기반 영향력 스코어를 analysis_results 테이블에 INSERT."""
         rows = [
-            (issue_id, post_id, score, 'rule-based')
-            for post_id, score in post_scores.items()
+            (issue_id, doc_id, score, 'rule-based')
+            for doc_id, score in doc_scores.items()
         ]
         async with self.pool.acquire() as conn:
             await conn.executemany("""
-                INSERT INTO issue_cracker.analysis_results
+                INSERT INTO deep_insight.analysis_results
                     (issue_id, target_type, target_id, influence_score, model_version)
-                VALUES ($1, 'post', $2, $3, $4)
+                VALUES ($1, 'doc', $2, $3, $4)
                 ON CONFLICT (issue_id, target_type, target_id, model_version) DO NOTHING
             """, rows)
         return len(rows)
@@ -310,7 +310,7 @@ class AnalyzerAgent:
         self,
         comments: list[dict],
         analysis_results: list[dict],
-        post_scores: dict[str, int],
+        doc_scores: dict[int, int],
         issue_id: str,
     ) -> str:
         """메모리 데이터로 시간당 집계 → ForecasterAgent 입력 CSV 생성."""
@@ -347,14 +347,14 @@ class AnalyzerAgent:
             lambda cid: analysis_map.get(cid, {}).get("is_advocate", False)
         )
         
-        # 인플루언서 임팩트 (해당 시간에 메가 인플루언서 post가 있는지)
+        # 인플루언서 임팩트 (해당 시간에 메가 인플루언서 doc가 있는지)
         influencer_hours = set()
-        for p_id, score in post_scores.items():
+        for d_id, score in doc_scores.items():
             if score >= 1:
-                # 해당 post의 댓글이 속한 시간대
-                post_comments = df[df["post_id"] == p_id]
-                if not post_comments.empty:
-                    influencer_hours.update(post_comments["hour_bucket"].unique())
+                # 해당 doc의 댓글이 속한 시간대
+                doc_comments = df[df["doc_id"] == d_id]
+                if not doc_comments.empty:
+                    influencer_hours.update(doc_comments["hour_bucket"].unique())
         
         # 시간별 감성 분석 결과 취합
         analyzed = df[df["sentiment"].notna()]
@@ -554,8 +554,8 @@ class AnalyzerAgent:
         self,
         comments: list[dict],
         analysis_results: list[dict],
-        posts: list[dict],
-        post_scores: dict[str, int],
+        docs: list[dict],
+        doc_scores: dict[int, int],
     ) -> dict:
         """시간별 감성 구성 + 이벤트 마커를 생성.
         
@@ -615,25 +615,25 @@ class AnalyzerAgent:
                 "advocate_ratio": round(row["advocate_count"] / total, 3),
             })
         
-        # 이벤트 마커: 인플루언서 저격 (influence_score >= 2인 posts)
+        # 이벤트 마커: 인플루언서 저격 (influence_score >= 2인 docs)
         event_markers = []
-        for p in posts:
-            score = post_scores.get(p["post_id"], 0)
+        for d in docs:
+            score = doc_scores.get(d["doc_id"], 0)
             if score >= 2:
-                p_time = pd.Timestamp(p["created_at"])
+                d_time = pd.Timestamp(d.get("published_at") or d.get("created_at"))
                 hour_offset = int(
-                    (p_time - first_hour).total_seconds() / 3600
+                    (d_time - first_hour).total_seconds() / 3600
                 )
                 event_markers.append({
                     "hour": hour_offset,
-                    "timestamp": p["created_at"],
+                    "timestamp": d.get("published_at") or d.get("created_at"),
                     "type": "influencer_hit",
                     "label": (
-                        f"{p.get('author_name', '?')} ({p.get('platform', '?')}) "
-                        f"- {p.get('title', '')[:40]}"
+                        f"{d.get('author_name', '?')} ({d.get('channel', '?')}) "
+                        f"- {d.get('title', '')[:40]}"
                     ),
-                    "view_count": p.get("view_count", 0),
-                    "followers": p.get("author_followers", 0),
+                    "view_count": d.get("view_count", 0),
+                    "followers": d.get("author_followers", 0),
                 })
         
         return {
@@ -646,8 +646,8 @@ class AnalyzerAgent:
     # ==========================================
     async def _identify_kols(
         self,
-        posts: list[dict],
-        post_scores: dict[str, int],
+        docs: list[dict],
+        doc_scores: dict[int, int],
     ) -> list[dict]:
         """영향력 높은 작성자(KOL)를 식별하고 LLM으로 성향/대응 권고를 생성.
         
@@ -660,27 +660,27 @@ class AnalyzerAgent:
             "influence_score", "key_content", "view_count", 
             "estimated_reach", "risk_assessment"}, ...]
         """
-        # influence_score >= 1인 posts 필터링 + 조회수 순 정렬
-        kol_posts = [
-            p for p in posts
-            if post_scores.get(p["post_id"], 0) >= 1
+        # influence_score >= 1인 docs 필터링 + 조회수 순 정렬
+        kol_docs = [
+            d for d in docs
+            if doc_scores.get(d["doc_id"], 0) >= 1
         ]
-        kol_posts.sort(key=lambda p: p.get("view_count", 0), reverse=True)
-        kol_posts = kol_posts[:10]
+        kol_docs.sort(key=lambda d: d.get("view_count", 0), reverse=True)
+        kol_docs = kol_docs[:10]
         
-        if not kol_posts:
+        if not kol_docs:
             return []
         
         # LLM으로 각 KOL의 성향(stance)과 대응 권고(risk_assessment) 생성
         kol_texts = []
-        for i, p in enumerate(kol_posts):
-            body_snippet = (p.get("body") or "")[:200]
+        for i, d in enumerate(kol_docs):
+            body_snippet = (d.get("body") or d.get("snippet") or "")[:200]
             kol_texts.append(
-                f"[{i+1}] author={p.get('author_name', '?')}, "
-                f"platform={p.get('platform', '?')}, "
-                f"followers={p.get('author_followers', 0):,}, "
-                f"views={p.get('view_count', 0):,}, "
-                f"title=\"{p.get('title', '')[:80]}\"\n"
+                f"[{i+1}] author={d.get('author_name', '?')}, "
+                f"channel={d.get('channel', '?')}, "
+                f"followers={d.get('author_followers', 0):,}, "
+                f"views={d.get('view_count', 0):,}, "
+                f"title=\"{d.get('title', '')[:80]}\"\n"
                 f"    내용: {body_snippet}"
             )
         
@@ -715,20 +715,20 @@ stance 기준:
         stance_map = {s["index"]: s for s in stance_results if isinstance(s, dict)}
         
         kols = []
-        for i, p in enumerate(kol_posts):
+        for i, d in enumerate(kol_docs):
             stance_info = stance_map.get(i + 1, {})
             estimated_reach = (
-                p.get("view_count", 0) + (p.get("share_count", 0) or 0) * 50
+                d.get("view_count", 0) + (d.get("share_count", 0) or 0) * 50
             )
             
             kols.append({
-                "author_name": p.get("author_name", "?"),
-                "platform": p.get("platform", "?"),
-                "followers": p.get("author_followers", 0),
-                "view_count": p.get("view_count", 0),
-                "influence_score": post_scores.get(p["post_id"], 0),
-                "key_content": p.get("title", "")[:100],
-                "url": p.get("url", ""),
+                "author_name": d.get("author_name", "?"),
+                "channel": d.get("channel", "?"),
+                "followers": d.get("author_followers", 0),
+                "view_count": d.get("view_count", 0),
+                "influence_score": doc_scores.get(d["doc_id"], 0),
+                "key_content": d.get("title", "")[:100],
+                "url": d.get("url", ""),
                 "estimated_reach": estimated_reach,
                 "stance": stance_info.get("stance", "unknown"),
                 "risk_assessment": stance_info.get("risk_assessment", ""),
@@ -843,23 +843,23 @@ class BatchAnalyzer:
             lines.append(json.dumps(request, ensure_ascii=False))
         return lines
     
-    async def _load_unanalyzed(self, issue_id: str, post_ids: list[str]) -> list[dict]:
-        """Retriever가 확보한 posts의 댓글 중, 이 issue에서 미분석인 것만 로드."""
-        if not post_ids:
+    async def _load_unanalyzed(self, issue_id: str, doc_ids: list[int]) -> list[dict]:
+        """Retriever가 확보한 docs의 댓글 중, 이 issue에서 미분석인 것만 로드."""
+        if not doc_ids:
             return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT c.comment_id, c.body, c.like_count, c.reply_count
-                FROM issue_cracker.comments c
-                LEFT JOIN issue_cracker.analysis_results ar
+                SELECT c.comment_id, c.content AS body
+                FROM deep_insight.collected_doc_comment c
+                LEFT JOIN deep_insight.analysis_results ar
                     ON ar.target_type = 'comment'
                     AND ar.target_id = c.comment_id
                     AND ar.issue_id = $1
                     AND ar.model_version = $3
-                WHERE c.post_id = ANY($2)
+                WHERE c.doc_id = ANY($2)
                   AND ar.id IS NULL
-                ORDER BY c.created_at
-            """, issue_id, post_ids, self.model_name)
+                ORDER BY c.published_at
+            """, issue_id, doc_ids, self.model_name)
         return [dict(r) for r in rows]
     
     async def _apply_batch_results(self, gcs_output: str, issue_id: str):
@@ -888,14 +888,14 @@ class BatchAnalyzer:
         if all_analyses:
             async with self.pool.acquire() as conn:
                 await conn.executemany("""
-                    INSERT INTO issue_cracker.analysis_results
+                    INSERT INTO deep_insight.analysis_results
                         (issue_id, target_type, target_id,
                          sentiment, sentiment_score, is_mockery, is_advocate,
                          model_version)
                     VALUES ($1, 'comment', $2, $3, $4, $5, $6, $7)
                     ON CONFLICT (issue_id, target_type, target_id, model_version) DO NOTHING
                 """, [
-                    (issue_id, a["comment_id"], a["sentiment"],
+                    (issue_id, int(a["comment_id"]), a["sentiment"],
                      a["sentiment_score"], a["is_mockery"], a["is_advocate"],
                      self.model_name)
                     for a in all_analyses

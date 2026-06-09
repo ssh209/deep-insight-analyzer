@@ -199,7 +199,7 @@ if start_btn:
         "search_queries": [],
         "search_embeddings": [],
         "search_time_hint": "",
-        "retrieved_post_ids": [],
+        "retrieved_doc_ids": [],
         "retrieved_comment_count": 0,
         "actual_nvi_history": [],
         "nvi_baseline_forecast": [],

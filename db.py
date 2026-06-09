@@ -6,6 +6,8 @@ DB 연결 풀 관리 모듈 — asyncpg 기반 PostgreSQL 연결.
   - 이 모듈은 연결만 담당, 프로비저닝은 별도 프로세스
   - DATABASE_URL이 비어있으면 None 반환 → CSV 모드 폴백
   - 연결 실패 시 앱 크래시 방지 → 경고 로그 + CSV 모드 폴백
+  - Collector 테이블(deep_insight.collected_doc 등)은 읽기 전용 참조
+  - Analyzer 전용 테이블은 deep_insight 스키마에 생성
 """
 import ssl
 import logging
@@ -88,29 +90,54 @@ async def close_db_pool(pool: Optional[asyncpg.Pool]) -> None:
 
 
 async def check_schema(pool: asyncpg.Pool) -> bool:
-    """issue_cracker 스키마와 핵심 테이블 존재 여부를 확인합니다.
+    """Collector 테이블 + Analyzer 스키마 존재 여부를 확인합니다.
+
+    확인 항목:
+      1. deep_insight.collected_doc — Collector 수집 데이터 (필수)
+      2. deep_insight.issues — Analyzer 전용 스키마 (필수)
 
     Returns:
-        True: 스키마 정상
-        False: 스키마 누락 (DDL 실행 필요)
+        True: 두 스키마 모두 정상
+        False: 하나라도 누락 (DDL 실행 필요)
     """
     try:
         async with pool.acquire() as conn:
-            result = await conn.fetchval("""
+            # 1. Collector 테이블 존재 확인
+            collector_ok = await conn.fetchval("""
                 SELECT EXISTS (
                     SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = 'issue_cracker'
+                    WHERE table_schema = 'deep_insight'
+                      AND table_name = 'collected_doc'
+                )
+            """)
+            if collector_ok:
+                logger.info("✅ Collector 테이블 확인 완료 (deep_insight.collected_doc)")
+            else:
+                logger.warning(
+                    "⚠️ Collector 테이블(deep_insight.collected_doc)이 없습니다. "
+                    "Collector의 db_schema/schema_collection.sql을 먼저 실행하세요."
+                )
+                return False
+
+            # 2. Analyzer 전용 스키마 확인
+            analyzer_ok = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'deep_insight'
                       AND table_name = 'issues'
                 )
             """)
-            if result:
-                logger.info("✅ issue_cracker 스키마 확인 완료")
+            if analyzer_ok:
+                logger.info("✅ Analyzer 스키마 확인 완료 (deep_insight.issues)")
             else:
                 logger.warning(
-                    "⚠️ issue_cracker 스키마가 없습니다. "
+                    "⚠️ Analyzer 스키마(deep_insight)가 없습니다. "
                     "sql/001_create_tables.sql을 실행하세요."
                 )
-            return result
+                return False
+
+            return True
+
     except Exception as e:
         logger.error(f"❌ 스키마 확인 실패: {e}")
         return False
